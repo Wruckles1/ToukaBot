@@ -252,7 +252,7 @@ def _process_saved_file(path: str) -> str:
         msg = f"Error processing `{os.path.basename(path)}`: {e}"
     return msg
 
-async def _ingest_attachments(attachments: list[discord.Attachment]) -> list[str]:
+async def _ingest_attachments(attachments: List[discord.Attachment]) -> List[str]:
     results = []
     for att in attachments or []:
         ext = os.path.splitext(att.filename.lower())[1]
