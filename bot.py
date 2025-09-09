@@ -21,6 +21,12 @@
 import os, json, re, asyncio, random, time
 from typing import List, Optional, Dict, Tuple
 
+import glob
+import functools
+import json
+from gtd_capture import capture_gtd_cards
+
+
 from PIL import Image, ImageDraw, ImageFont
 import discord
 from discord import app_commands
@@ -209,9 +215,28 @@ def _save_path(prefix: str, ext: str) -> str:
 
 # ---------------------- Ingestion helpers (uploads in Discord) -----------------
 def _sanitize_filename(name: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_\-\. ]+", "_", name)
-    safe = safe.strip().lstrip(".")
-    return safe or "file"
+    """
+    Keep original spaces/case; strip only path separators, control chars, and Windows-illegal characters.
+    Optionally convert underscores to spaces based on CONFIG["UNDERSCORE_TO_SPACE"].
+    """
+    # drop any directory parts
+    base = name.split("/")[-1].split("\\")[-1]
+    bad = set('<>:"\\|?*')
+    out_chars = []
+    for ch in base:
+        if ch in ('/', '\\') or ord(ch) < 32:
+            continue
+        if ch in bad:
+            continue
+        out_chars.append(ch)
+    out = ''.join(out_chars).rstrip(' .')
+    if CONFIG.get("UNDERSCORE_TO_SPACE", True):
+        import re as _re
+        out = out.replace('_', ' ')
+        out = _re.sub(r'\s+', ' ', out).strip()
+    if not out:
+        out = "file"
+    return out[:180]
 
 async def _save_attachment(att: discord.Attachment, dest_dir: str) -> str:
     os.makedirs(dest_dir, exist_ok=True)
@@ -227,7 +252,7 @@ def _process_saved_file(path: str) -> str:
     ext = os.path.splitext(base)[1]
     msg = None
     try:
-        if ext in (".png",".jpg",".jpeg",".webp",".gif"):
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
             msg = f"Image saved: `{os.path.basename(path)}`"
         elif ext == ".txt":
             if "units" in base:
@@ -242,10 +267,22 @@ def _process_saved_file(path: str) -> str:
             else:
                 msg = f"JSON saved: `{os.path.basename(path)}`"
         elif ext == ".zip":
-            import zipfile
+            import zipfile, io
+            count = 0
             with zipfile.ZipFile(path, 'r') as zf:
-                zf.extractall(ASSETS_DIR)
-            msg = "ZIP extracted into units_assets/"
+                for zinfo in zf.infolist():
+                    if zinfo.is_dir():
+                        continue
+                    data = zf.read(zinfo)
+                    fname = _sanitize_filename(zinfo.filename)
+                    if not fname:
+                        continue
+                    os.makedirs(ASSETS_DIR, exist_ok=True)
+                    dst = os.path.join(ASSETS_DIR, fname)
+                    with open(dst, "wb") as wf:
+                        wf.write(data)
+                    count += 1
+            msg = f"ZIP extracted {count} file(s) into units_assets/"
         else:
             msg = f"File saved (unknown type): `{os.path.basename(path)}`"
     except Exception as e:
@@ -901,6 +938,104 @@ async def ingest(interaction: discord.Interaction,
     await interaction.followup.send(f"**Ingest complete.**\n{summary}", ephemeral=True)
 
 # ------------------------------ Token loader ---------------------------------
+
+# === GTD: webhook uploader helpers ===
+def _ensure_under_limit(path: str, max_bytes: int) -> str:
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return path
+    except OSError:
+        return path
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    q = 90
+    tmp = os.path.splitext(path)[0] + ".jpg"
+    while q >= 50:
+        im.save(tmp, "JPEG", quality=q, optimize=True)
+        if os.path.getsize(tmp) <= max_bytes: break
+        q -= 10
+    return tmp
+
+def send_images_to_webhook(webhook_url: str, paths: list, caption="Garden TD value cards", max_mb=8, username=None):
+    max_bytes = max_mb * 1024 * 1024
+    with requests.Session() as s:
+        for i in range(0, len(paths), 10):  # Discord: ≤10 attachments/message
+            batch = paths[i:i+10]
+            form, opened = {}, []
+            try:
+                for idx, p in enumerate(batch):
+                    pp = _ensure_under_limit(p, max_bytes)
+                    f = open(pp, "rb"); opened.append(f)
+                    form[f"files[{idx}]"] = (os.path.basename(pp), f, "application/octet-stream")
+                payload = {"content": caption}
+                form["payload_json"] = (None, json.dumps(payload), "application/json")
+                r = s.post(GTD_WEBHOOK_URL, files=form, timeout=60)
+                if r.status_code == 429:
+                    import time
+                    time.sleep(r.json().get("retry_after", 1000) / 1000.0)
+                    r = s.post(GTD_WEBHOOK_URL, files=form, timeout=60)
+                r.raise_for_status()
+            finally:
+                for f in opened:
+                    try: f.close()
+                    except: pass
+
+# Default webhook; can override via env GTD_WEBHOOK_URL
+GTD_WEBHOOK_URL = os.getenv("GTD_WEBHOOK_URL", "https://discord.com/api/webhooks/1415085009714417864/xMkUAHRQd-9KZDbynYgVObuLBkZn4yY2jwPLGh_6xj2mC9ePwOmtO2oPrv1XKjwsAgJN")
+
+
+# === GTD: slash commands ===
+@tree.command(name="gtdshots", description="Capture official Garden TD value cards (all 7 pages) and upload here")
+@discord.app_commands.describe(pages="Total pages (default 7)", only="Optional regex to filter unit names")
+async def gtdshots_cmd(interaction: discord.Interaction, pages: int = 7, only: str = None):
+    await interaction.response.defer(thinking=True)
+    # Run blocking Playwright capture off-thread
+    loop = asyncio.get_event_loop()
+    paths = await loop.run_in_executor(
+        None,
+        functools.partial(
+            capture_gtd_cards,
+            pages=int(pages or 7),
+            out_dir="shots_from_bot",
+            only_regex=only,
+            channel=None,   # set to "msedge"/"chrome" if Chromium cannot be installed
+            headed=False,
+            debug=False
+        )
+    )
+    if not paths:
+        await interaction.followup.send("No images were produced."); return
+    for i in range(0, len(paths), 10):
+        batch = [discord.File(p) for p in paths[i:i+10]]
+        await interaction.followup.send(files=batch)
+        await asyncio.sleep(0.8)
+
+@tree.command(name="gtdwebhook", description="Capture value cards and send them via the configured webhook")
+@discord.app_commands.describe(pages="Total pages (default 7)", only="Optional regex to filter unit names")
+async def gtdwebhook_cmd(interaction: discord.Interaction, pages: int = 7, only: str = None):
+    if not GTD_WEBHOOK_URL:
+        await interaction.response.send_message("Webhook not configured. Set GTD_WEBHOOK_URL.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    loop = asyncio.get_event_loop()
+    paths = await loop.run_in_executor(
+        None,
+        functools.partial(
+            capture_gtd_cards,
+            pages=int(pages or 7),
+            out_dir="shots_webhook",
+            only_regex=only,
+            channel=None,
+            headed=False,
+            debug=False
+        )
+    )
+    if not paths:
+        await interaction.followup.send("No images were produced."); return
+    await loop.run_in_executor(None, functools.partial(send_images_to_webhook, GTD_WEBHOOK_URL, paths, "Garden TD values"))
+    await interaction.followup.send("Sent to webhook ✅", ephemeral=True)
+
+
 def load_token() -> str:
     tok = os.getenv("DISCORD_TOKEN")
     if tok: return tok.strip()
