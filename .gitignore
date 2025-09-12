@@ -3,3 +3,9 @@ __pycache__/
 media/ 
 token.txt 
 *.log 
+token.txt
+media/
+units_assets/
+economy.json
+__pycache__/
+.venv/

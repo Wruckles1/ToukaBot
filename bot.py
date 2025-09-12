@@ -1,1053 +1,805 @@
 
-# bot.py — ToukaBot (all-in-one)
-# Features:
-# - Token loader (DISCORD_TOKEN or token.txt)
-# - Units scanning from units_assets/ with aliases (aliases.json optional)
-# - /unit <name>  → composite image (main + stats)
-# - /units [name|per_page] → **button-paged** list or details
-# - /wheel [include|exclude] → CS:GO-style GIF that stops on winner + Respin
-# - /team [size|allow_duplicates|include|exclude] → roulette + collage + Respin
-# - /menu → clean button UI (case, team, values links, units)
-# - /values → link buttons to official site; /valueslive → experimental parser
-# - /assetsinfo → counts and assets folder path
-# - /reload → rescan assets/aliases/units
-# - /setoutputdir → change where GIFs/PNGs are saved (persisted to config.json)
-# - /configshow → print config
-# - Autorole on join: /autorole show|set|clear  (Members intent requested only if configured)
-# - Upload-to-update system: /updateset, /updateinfo, /ingest + auto ingest in channel
-#
-# Requires: discord.py>=2.3, Pillow, requests, beautifulsoup4
+# -*- coding: utf-8 -*-
+"""
+ToukaGTD bot - consolidated build
+Python 3.8 compatible (discord.py 2.x)
+Features:
+- Units database from units.txt + images in units_assets/
+- /unit <name> shows picture (and stats panel if "<name> 2.png" exists). Makes a small composite.
+- /units paginated list with next/back buttons
+- /wheel with "Respin" button; /team (7 random) with collage + "Respin Team"
+- /values -> opens value list URL
+- Attachment ingest: /ingest (upload 1..10 files) saving into the right places.
+- Economy/Gambling: /daily, /balance, /coinflip, /slots, /give, /leaderboard
+- Admin economy settings: /gambling_settings; /grant (banker/admin only); channel restriction + banker role
+- /sync (force-register commands to the server)
+- Manual image + gif generation uses Pillow only (no external tools)
+"""
+import os, io, json, random, math, asyncio, time, textwrap, contextlib
+from typing import Optional, List, Dict, Tuple
 
-import os, json, re, asyncio, random, time
-from typing import List, Optional, Dict, Tuple
-
-import glob
-import functools
-import json
-from gtd_capture import capture_gtd_cards
-
-
-from PIL import Image, ImageDraw, ImageFont
 import discord
 from discord import app_commands
+from discord.ext import commands
 
-# ----------------------------- Config / Paths --------------------------------
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
 
-UNITS_TXT    = os.getenv("UNITS_TXT", "units.txt")
-ASSETS_DIR   = os.getenv("UNITS_ASSETS_DIR", "units_assets")
-ALIASES_JSON = os.getenv("ALIASES_JSON", "aliases.json")
-CONFIG_JSON  = os.getenv("CONFIG_JSON", "config.json")
+# -------------------- Configuration --------------------
+ASSETS_DIR = os.environ.get("ASSETS_DIR", "units_assets")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "media")
+CONFIG_PATH = "config.json"
+ECON_PATH = "economy.json"
+UNITS_TXT = "units.txt"
+ALIASES_JSON = "aliases.json"
+TOKEN_PATH = "token.txt"
 
-VALUES_URL   = os.getenv("VALUES_URL", "https://sites.google.com/view/garden-td-values/main-page?authuser=0")
-CALC_URL     = os.getenv("CALC_URL",   "https://sites.google.com/view/garden-td-values/value-calculator?authuser=0")
-
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, object] = {
     "UPDATE_CHANNEL_ID": None,
-    "OUTPUT_DIR": "media",
-    "SHOW_COLLAGE": True,
-    "STRIP_TILE_W": 128,
-    "STRIP_TILE_H": 96,
-    "STRIP_PAD": 6,
-    "STRIP_BG": "#c49a6c",
-    "STRIP_CARD": "#4a3a2a",
-    "SPIN_HOPS_SLOT": 9,
-    "CASE_VISIBLE": 7,
-    "CASE_FRAMES": 18,
-    "CASE_DURATION_MS": 90,
-    "CASE_FINAL_HOLD_MS": 1600,
-    "GIF_LOOP": 1,
-    "AUTO_ROLE_ID": None
+    "UNDERSCORE_TO_SPACE": True,
+    "SPIN_STRIP_W": 640,
+    "SPIN_STRIP_H": 120,
+    "SPIN_VISIBLE": 7,
+    "SPIN_HOPS_SLOT": 12,       # spin duration (steps) for /wheel
+    "GAMBLING_ENABLED": True,
+    "CURRENCY": "🍀",
+    "MIN_BET": 10,
+    "MAX_BET": 50000,
+    "HOUSE_EDGE": 0.02,         # 2%
+    "DAILY_AMOUNT": 500,
+    "GAMBLING_CHANNEL_ID": None,
+    "BANKER_ROLE_ID": None
 }
 
-def _load_json(path: str) -> Optional[dict]:
+def _load_json(path: str, fallback):
     try:
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return None
-    return None
+        return fallback
 
-def _save_json(path: str, data: dict) -> None:
+def _save_json(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+CONFIG: Dict[str, object] = _load_json(CONFIG_PATH, DEFAULT_CONFIG.copy())
+for k, v in DEFAULT_CONFIG.items():
+    CONFIG.setdefault(k, v)
+
+ECON: Dict[str, Dict] = _load_json(ECON_PATH, {
+    "balances": {},      # {guild_id: {user_id: int}}
+    "last_daily": {},    # {guild_id: {user_id: ts}}
+    "settings": {}       # {guild_id: {... overrides ...}}
+})
+
+def _save_econ():
+    _save_json(ECON_PATH, ECON)
+
+# -------------------- Helpers --------------------
+def norm_key(name: str) -> str:
+    return " ".join(name.lower().replace("_", " ").split())
+
+def list_units() -> List[str]:
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("[config] save failed:", e)
-
-CONFIG = DEFAULT_CONFIG.copy()
-cfg = _load_json(CONFIG_JSON)
-if cfg:
-    for k in DEFAULT_CONFIG:
-        if k in cfg:
-            CONFIG[k] = cfg[k]
-
-OUTPUT_DIR = str(CONFIG.get("OUTPUT_DIR") or "media").strip() or "media"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def _parse_color(s: str):
-    s = str(s)
-    if s.startswith("#") and len(s) == 7:
-        return (int(s[1:3],16), int(s[3:5],16), int(s[5:7],16), 255)
-    return (196,154,108,255)
-
-def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[_\-]+", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def load_units() -> List[str]:
-    units: List[str] = []
-    if os.path.isfile(UNITS_TXT):
         with open(UNITS_TXT, "r", encoding="utf-8") as f:
-            for line in f:
-                name = " ".join(line.strip().split())
-                if name: units.append(name)
-    else:
-        for k in scan_images(ASSETS_DIR).keys():
-            units.append(" ".join(w.capitalize() for w in k.split()))
-    if not units:
-        units = ["Tomato","Cactus","Pumpkin","Rose","Umbra","Onion","Bee"]
-    dedup = list(dict.fromkeys(units))
-    return sorted(dedup, key=str.lower)
-
-def scan_images(root: Optional[str]) -> Dict[str, List[str]]:
-    mp: Dict[str, List[str]] = {}
-    if not root or not os.path.isdir(root): return mp
-    for dirpath, _, files in os.walk(root):
-        for f in files:
-            if not f.lower().endswith((".png",".jpg",".jpeg",".webp",".gif")): continue
-            base = os.path.splitext(f)[0]
-            base = re.sub(r"\s+(\d+)$", "", base)  # drop trailing numbers for key
-            key  = _norm(base)
-            mp.setdefault(key, []).append(os.path.join(dirpath, f))
-    for k in mp: mp[k].sort(key=lambda p: p.lower())
-    return mp
+            out = []
+            for ln in f:
+                s = ln.strip()
+                if not s or s.startswith("#"): 
+                    continue
+                out.append(s)
+            return out
+    except Exception:
+        return []
 
 def load_aliases() -> Dict[str, str]:
-    al = {}
-    j = _load_json(ALIASES_JSON)
-    if j:
-        for k, v in j.items():
-            if k and v: al[_norm(k)] = v.strip()
-    for k,v in {"rb":"Rosebeam","bb":"Blueberries","gc":"Galactic Shroom"}.items():
-        al.setdefault(_norm(k), v)
-    return al
+    data = _load_json(ALIASES_JSON, {})
+    # normalize keys
+    return {norm_key(k): v for k, v in data.items()}
 
-IMAGES: Dict[str, List[str]] = scan_images(ASSETS_DIR)
-ALIASES: Dict[str, str] = load_aliases()
-UNITS: List[str] = load_units()
+ALIASES = load_aliases()
 
-def resolve_alias(name: str) -> str:
-    return ALIASES.get(_norm(name), name)
-
-def find_images_for(name: str) -> List[str]:
-    key = _norm(name)
-    if key in IMAGES: return IMAGES[key][:]
-    for k in IMAGES:
-        if key.startswith(k) or k.startswith(key): return IMAGES[k][:]
-    for k in IMAGES:
-        if key in k or k in key: return IMAGES[k][:]
-    return []
-
-def pick_main_and_stats(imgs: List[str]) -> Tuple[Optional[str], Optional[str]]:
-    if not imgs: return (None, None)
-    def score(p):
-        fn = os.path.basename(p).lower(); s=0
-        if re.search(r"(^|[ _\-])1(\D|$)", fn): s += 3
-        if not re.search(r"(^|[ _\-])[12](\D|$)", fn): s += 2
-        if "icon" in fn or "card" in fn: s += 1
-        return s
-    main = max(imgs, key=score)
-    candidates = sorted(imgs, key=lambda p: (
-        "stats" not in os.path.basename(p).lower(),
-        not re.search(r"(^|[ _\-])2(\D|$)", os.path.basename(p).lower()),
-        os.path.basename(p).lower()
-    ))
-    stats=None
-    for p in candidates:
-        if p != main: stats=p; break
-    if stats == main: stats=None
-    return (main, stats)
-
-def filter_pool(src: List[str], include: Optional[str], exclude: Optional[str]) -> List[str]:
-    inc = [t.strip().lower() for t in (include or "").replace(",", " ").split() if t.strip()]
-    exc = [t.strip().lower() for t in (exclude or "").replace(",", " ").split() if t.strip()]
-    out = []
-    for n in src:
-        low = n.lower()
-        keep=True
-        if inc and not any(tok in low for tok in inc): keep=False
-        if exc and any(tok in low for tok in exc): keep=False
-        if keep: out.append(n)
-    return out
-
-def _get_fonts():
-    try:
-        return (
-            ImageFont.truetype("arial.ttf", 14),
-            ImageFont.truetype("arialbd.ttf", 18),
-            ImageFont.truetype("arialbd.ttf", 16)
-        )
-    except Exception:
-        f = ImageFont.load_default()
-        return (f, f, f)
-
-def _text_wh(draw, font, text: str):
-    try:
-        bbox = draw.textbbox((0,0), text, font=font)
-        return bbox[2]-bbox[0], bbox[3]-bbox[1]
-    except Exception:
-        try:
-            bbox = font.getbbox(text)
-            return bbox[2]-bbox[0], bbox[3]-bbox[1]
-        except Exception:
-            try: return (font.getlength(text), font.size)
-            except Exception: return (len(text)*8, 16)
-
-def _save_path(prefix: str, ext: str) -> str:
-    fn = f"{prefix}_{int(time.time()*1000)}.{ext}"
-    path = os.path.join(OUTPUT_DIR, fn)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    return path
-
-# ---------------------- Ingestion helpers (uploads in Discord) -----------------
-def _sanitize_filename(name: str) -> str:
-    """
-    Keep original spaces/case; strip only path separators, control chars, and Windows-illegal characters.
-    Optionally convert underscores to spaces based on CONFIG["UNDERSCORE_TO_SPACE"].
-    """
-    # drop any directory parts
-    base = name.split("/")[-1].split("\\")[-1]
-    bad = set('<>:"\\|?*')
-    out_chars = []
-    for ch in base:
-        if ch in ('/', '\\') or ord(ch) < 32:
-            continue
-        if ch in bad:
-            continue
-        out_chars.append(ch)
-    out = ''.join(out_chars).rstrip(' .')
+def unit_to_filename(name: str) -> str:
+    # prefer exact match in assets; fallback sanitize
+    base = name
     if CONFIG.get("UNDERSCORE_TO_SPACE", True):
-        import re as _re
-        out = out.replace('_', ' ')
-        out = _re.sub(r'\s+', ' ', out).strip()
-    if not out:
-        out = "file"
-    return out[:180]
+        base = base.replace("_", " ")
+    return base
 
-async def _save_attachment(att: discord.Attachment, dest_dir: str) -> str:
-    os.makedirs(dest_dir, exist_ok=True)
-    data = await att.read()
-    fn = _sanitize_filename(att.filename)
-    path = os.path.join(dest_dir, fn)
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
-
-def _process_saved_file(path: str) -> str:
-    base = os.path.basename(path).lower()
-    ext = os.path.splitext(base)[1]
-    msg = None
-    try:
-        if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-            msg = f"Image saved: `{os.path.basename(path)}`"
-        elif ext == ".txt":
-            if "units" in base:
-                os.replace(path, UNITS_TXT)
-                msg = "units.txt updated"
-            else:
-                msg = f"TXT saved: `{os.path.basename(path)}`"
-        elif ext == ".json":
-            if "aliases" in base:
-                os.replace(path, ALIASES_JSON)
-                msg = "aliases.json updated"
-            else:
-                msg = f"JSON saved: `{os.path.basename(path)}`"
-        elif ext == ".zip":
-            import zipfile, io
-            count = 0
-            with zipfile.ZipFile(path, 'r') as zf:
-                for zinfo in zf.infolist():
-                    if zinfo.is_dir():
-                        continue
-                    data = zf.read(zinfo)
-                    fname = _sanitize_filename(zinfo.filename)
-                    if not fname:
-                        continue
-                    os.makedirs(ASSETS_DIR, exist_ok=True)
-                    dst = os.path.join(ASSETS_DIR, fname)
-                    with open(dst, "wb") as wf:
-                        wf.write(data)
-                    count += 1
-            msg = f"ZIP extracted {count} file(s) into units_assets/"
-        else:
-            msg = f"File saved (unknown type): `{os.path.basename(path)}`"
-    except Exception as e:
-        msg = f"Error processing `{os.path.basename(path)}`: {e}"
-    return msg
-
-async def _ingest_attachments(attachments: List[discord.Attachment]) -> List[str]:
-    results = []
-    for att in attachments or []:
-        ext = os.path.splitext(att.filename.lower())[1]
-        dst = ASSETS_DIR if ext in (".png",".jpg",".jpeg",".webp",".gif",".zip") else OUTPUT_DIR
-        path = await _save_attachment(att, dst)
-        results.append(_process_saved_file(path))
-    global IMAGES, ALIASES, UNITS
-    IMAGES = scan_images(ASSETS_DIR)
-    ALIASES = load_aliases()
-    UNITS = load_units()
-    return results
-
-# --------------------------- Builders (images/GIFs) ---------------------------
-def build_strip(names: List[str]) -> Optional[str]:
-    font_num, font_cost, font_name = _get_fonts()
-    TW=CONFIG["STRIP_TILE_W"]; TH=CONFIG["STRIP_TILE_H"]; PAD=CONFIG["STRIP_PAD"]
-    card=_parse_color(CONFIG["STRIP_CARD"]); bg=_parse_color(CONFIG["STRIP_BG"])
-    W = PAD + len(names)*(TW+PAD); H = PAD*2 + TH
-    canvas = Image.new("RGBA", (W,H), bg); draw = ImageDraw.Draw(canvas)
-    def rrect(x0,y0,x1,y1,r=10,fill=(0,0,0,255)):
-        try: draw.rounded_rectangle([x0,y0,x1,y1], radius=r, fill=fill)
-        except Exception: draw.rectangle([x0,y0,x1,y1], fill=fill)
-    for i,nm in enumerate(names):
-        x = PAD + i*(TW+PAD); y = PAD
-        rrect(x,y,x+TW,y+TH,10,card)
-        imgs = find_images_for(nm)
-        main,_ = pick_main_and_stats(imgs)
-        if main and os.path.isfile(main):
-            try:
-                im = Image.open(main).convert("RGBA")
-                im.thumbnail((TW-10, TH-28))
-                ix = x + (TW-im.width)//2; iy = y + 4
-                canvas.paste(im, (ix,iy), im)
-            except Exception: pass
-        cx,cy = x+12, y+12
-        draw.ellipse((cx-11,cy-11,cx+11,cy+11), fill=(30,30,30,220))
-        txt = str(i+1); w,h = _text_wh(draw, font_num, txt)
-        draw.text((cx-w/2,cy-h/2-1), txt, fill=(255,255,255,255), font=font_num)
-    out = _save_path("team_strip", "png"); canvas.save(out); return out
-
-def build_unit_composite(name: str) -> Optional[str]:
-    imgs = find_images_for(name)
-    if not imgs: return None
-    main, stats = pick_main_and_stats(imgs)
-    try:
-        im1 = Image.open(main).convert("RGBA") if main else None
-        im2 = Image.open(stats).convert("RGBA") if stats else None
-    except Exception:
+def asset_path_for(name: str, panel: int = 1) -> Optional[str]:
+    """
+    Try to find "<name> 1.png" and "<name> 2.png" style images.
+    Accepts variations with underscores/spaces and capitalization.
+    """
+    if not os.path.isdir(ASSETS_DIR):
         return None
-    if im1 and im2:
-        scale = 450
-        def scale_to_h(im):
-            r = scale / im.height
-            return im.resize((int(im.width*r), scale))
-        im1 = scale_to_h(im1); im2 = scale_to_h(im2)
-        out = Image.new("RGBA", (im1.width+im2.width, scale), (20,20,20,255))
-        out.paste(im1, (0,0), im1); out.paste(im2, (im1.width,0), im2)
-    else:
-        im = im1 or im2
-        if im is None: return None
-        scale = 450; r = scale / im.height
-        out = im.resize((int(im.width*r), scale))
-    draw = ImageDraw.Draw(out)
-    try: font = ImageFont.truetype("arial.ttf", 24)
-    except Exception: font = ImageFont.load_default()
-    title = " ".join(w.capitalize() for w in _norm(name).split())
-    tw, th = _text_wh(draw, font, title)
-    bar_h = th + 10
-    draw.rectangle([0,0,out.width,bar_h], fill=(0,0,0,160))
-    draw.text((10,(bar_h-th)//2), title, fill=(255,255,255,255), font=font)
-    path = _save_path("unit", "png"); out.save(path); return path
-
-def _frame_strip(seq: List[str], offset_px: int) -> Image.Image:
-    T = {
-        "tile_w": CONFIG["STRIP_TILE_W"],
-        "tile_h": CONFIG["STRIP_TILE_H"],
-        "pad": CONFIG["STRIP_PAD"],
-        "bg": _parse_color(CONFIG["STRIP_BG"]),
-        "card": _parse_color(CONFIG["STRIP_CARD"]),
-        "visible": CONFIG["CASE_VISIBLE"],
+    candidates = []
+    base = unit_to_filename(name)
+    roots = {
+        base,
+        base.replace(" ", "_"),
+        base.replace("_", " ")
     }
-    V = T["visible"]
-    TW, TH, PAD = T["tile_w"], T["tile_h"], T["pad"]
-    vw = PAD + V*(TW+PAD)
-    vh = PAD*2 + TH + 22
-    canvas = Image.new("RGBA", (vw, vh), T["bg"])
-    draw = ImageDraw.Draw(canvas)
-    try: font = ImageFont.truetype("arial.ttf", 14)
-    except Exception: font = ImageFont.load_default()
-    def rrect(x0,y0,x1,y1,rad=10,fill=(0,0,0,180)):
-        try: draw.rounded_rectangle([x0,y0,x1,y1], radius=rad, fill=fill)
-        except Exception: draw.rectangle([x0,y0,x1,y1], fill=fill)
-    x = PAD - offset_px
-    for nm in seq:
-        if x > vw: break
-        rrect(x, PAD, x+TW, PAD+TH, 10, T["card"])
-        imgs = find_images_for(nm); main,_ = pick_main_and_stats(imgs)
-        if main and os.path.isfile(main):
-            try:
-                im = Image.open(main).convert("RGBA"); im.thumbnail((TW-10, TH-28))
-                ix = x + (TW-im.width)//2; iy = PAD + 4
-                canvas.paste(im, (ix,iy), im)
-            except Exception: pass
-        w,h = _text_wh(draw, font, nm)
-        draw.text((x+(TW-w)//2, PAD+TH-2), nm[:22], fill=(240,240,240,255), font=font)
-        x += TW + PAD
-    cx = PAD + (V//2)*(TW+PAD)
-    rrect(cx-2, PAD-2, cx+TW+2, PAD+TH+2, 8, (250,220,80,120))
-    return canvas
+    exts = [".png", ".jpg", ".jpeg"]
+    suffixes = [f" {panel}", f"_{panel}", ""] if panel == 1 else [f" {panel}", f"_{panel}"]
+    for root in roots:
+        for suf in suffixes:
+            for ext in exts:
+                p = os.path.join(ASSETS_DIR, f"{root}{suf}{ext}")
+                if os.path.isfile(p):
+                    candidates.append(p)
+    return candidates[0] if candidates else None
 
-def _ease_out_cubic(t: float) -> float: return 1 - (1 - t)**3
+def find_unit(query: str) -> Optional[str]:
+    # alias first
+    key = norm_key(query)
+    if key in ALIASES:
+        return ALIASES[key]
+    # exact line in units.txt
+    units = list_units()
+    if not units:
+        return None
+    low = [u.lower() for u in units]
+    if key in low:
+        return units[low.index(key)]
+    # prefix/stem match
+    for u in units:
+        if norm_key(u).startswith(key):
+            return u
+    # contains
+    for u in units:
+        if key in norm_key(u):
+            return u
+    return None
 
-def build_case_gif_stopping(pool: List[str]) -> Tuple[str, str]:
-    V = CONFIG["CASE_VISIBLE"]; TW=CONFIG["STRIP_TILE_W"]; PAD=CONFIG["STRIP_PAD"]
-    winner = random.choice(pool)
-    pre = random.choices(pool, k=V+5)
-    seq = pre + [winner] + random.choices(pool, k=2)
-    center_x = PAD + (V//2)*(TW+PAD)
-    winner_index = len(pre)
-    final_offset = PAD + winner_index*(TW+PAD) - center_x
-    frames = max(14, int(CONFIG["CASE_FRAMES"]))
-    offsets = []
-    for i in range(frames-1):
-        t = i/(frames-1); offsets.append(int(final_offset * _ease_out_cubic(t)))
-        if i and offsets[i] < offsets[i-1]: offsets[i] = offsets[i-1]
-    offsets.append(final_offset)
-    images=[]; durations=[]
-    for i, off in enumerate(offsets):
-        frame = _frame_strip(seq, off).convert("P", palette=Image.ADAPTIVE)
-        images.append(frame)
-        durations.append(CONFIG["CASE_FINAL_HOLD_MS"] if i==len(offsets)-1 else CONFIG["CASE_DURATION_MS"])
-    out = _save_path("wheel_case", "gif")
-    images[0].save(out, save_all=True, append_images=images[1:], duration=durations, loop=int(CONFIG.get("GIF_LOOP",1)), disposal=2)
-    return out, winner
+def ensure_dirs():
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ----------------------------- Discord setup ---------------------------------
-want_members_intent = bool(CONFIG.get("AUTO_ROLE_ID"))
-if os.getenv("FORCE_MEMBERS_INTENT") == "1": want_members_intent = True
-intents = discord.Intents.default()
-intents.members = bool(want_members_intent)
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+ensure_dirs()
 
-@bot.event
-async def on_ready():
-    print(f"[ready] Logged in as {bot.user} (ID: {bot.user.id})")
+# -------------------- Image helpers --------------------
+FONT = None
+if PIL_OK:
     try:
-        guild_ids = os.getenv("GUILD_IDS", "").strip()
-        if guild_ids:
-            ids = [int(x) for x in guild_ids.split(",") if x.strip().isdigit()]
-            for gid in ids:
-                await tree.sync(guild=discord.Object(id=gid))
-                print(f"[sync] commands synced to guild {gid}")
-        await tree.sync()
-        print("[sync] global commands synced")
-    except Exception as e:
-        print("[sync] failed:", e)
-    total_imgs=sum(len(v) for v in IMAGES.values())
-    print(f"[assets] folder={ASSETS_DIR} groups={len(IMAGES)} files={total_imgs}")
-    print(f"[output] {OUTPUT_DIR}")
+        FONT = ImageFont.load_default()
+    except Exception:
+        FONT = None
 
-@bot.event
-async def on_message(message: discord.Message):
-    if not message.guild or message.author.bot:
-        return
-    ch_id = CONFIG.get("UPDATE_CHANNEL_ID")
-    if not ch_id or int(ch_id) != message.channel.id:
-        return
-    if not (message.author.guild_permissions.manage_guild or (OWNER_ID and message.author.id == OWNER_ID)):
-        return
-    if not message.attachments:
-        return
+def compose_unit_panel(name: str) -> Optional[bytes]:
+    """If we have '<name> 1.png' and '<name> 2.png', stack them; else return the single image."""
+    p1 = asset_path_for(name, 1) or asset_path_for(name, 0) or asset_path_for(name, -1)
+    p2 = asset_path_for(name, 2)
+    if not p1 and not p2:
+        return None
+    if not PIL_OK or not p1:
+        # return the 'stats' panel if only it exists
+        target = p1 or p2
+        with open(target, "rb") as f:
+            return f.read()
     try:
-        results = await _ingest_attachments(message.attachments)
-        summary = "\n".join(f"• {r}" for r in results if r)
-        await message.reply(f"**Ingest complete.**\n{summary or 'No files processed.'}")
-    except Exception as e:
-        await message.reply(f"Ingest failed: `{e}`")
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    role_id = CONFIG.get("AUTO_ROLE_ID")
-    if not role_id: return
-    try:
-        role = member.guild.get_role(int(role_id))
-        if role: await member.add_roles(role, reason="Auto role on join")
-    except Exception as e:
-        print("[autorole] failed:", e)
-
-# ----------------------------- Values (links + live) --------------------------
-def _try_fetch_values(url: str = VALUES_URL):
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-    except Exception as e:
-        return None, f"Missing deps: {e}. Install requests and beautifulsoup4."
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (ToukaBot)"}
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
-        soup = BeautifulSoup(r.text, "html.parser")
-        rows = []
-        for table in soup.find_all("table"):
-            for tr in table.find_all("tr"):
-                cells = [c.get_text(strip=True) for c in tr.find_all(["td","th"])]
-                if len(cells) >= 2 and cells[0] and cells[1]:
-                    if cells[0].lower() in ("unit","name") and cells[1].lower().startswith(("value","worth")):
-                        continue
-                    rows.append({"name": cells[0], "value": cells[1]})
-        if not rows:
-            for li in soup.find_all(["li","p","div"]):
-                txt = li.get_text(" ", strip=True)
-                if " - " in txt or " – " in txt:
-                    parts = [x.strip() for x in re.split(r"\s+[–-]\s+", txt, maxsplit=1)]
-                    if len(parts) == 2 and len(parts[0]) <= 60 and len(parts[1]) <= 60:
-                        rows.append({"name": parts[0], "value": parts[1]})
-        seen = set(); out = []
-        for r0 in rows:
-            key = (r0["name"].lower(), r0["value"].lower())
-            if key in seen: continue
-            seen.add(key); out.append(r0)
-        if not out:
-            return None, "Could not parse any values from the page."
-        return out, None
-    except Exception as e:
-        return None, f"Error: {e}"
-
-class ValuesPagerView(discord.ui.View):
-    def __init__(self, data, page_size=10):
-        super().__init__(timeout=120)
-        self.data = data or []
-        self.page_size = max(5, min(25, int(page_size or 10)))
-        self.page = 1
-        self.pages = max(1, (len(self.data) + self.page_size - 1)//self.page_size)
-        self.add_item(discord.ui.Button(label="Values (Main Page)", url=VALUES_URL))
-        self.add_item(discord.ui.Button(label="Calculator", url=CALC_URL))
-
-    def build_embed(self):
-        start = (self.page-1)*self.page_size
-        chunk = self.data[start:start+self.page_size]
-        desc = "\n".join(f"**{i+start+1}. {row['name']}** — `{row['value']}`" for i, row in enumerate(chunk)) or "—"
-        e = discord.Embed(
-            title=f"Garden TD Values (page {self.page}/{self.pages})",
-            description=desc,
-            color=discord.Color.green()
-        )
-        e.set_footer(text="Parsed from the website — buttons link to official pages")
-        return e
-
-    async def update(self, interaction: discord.Interaction):
-        for b in self.children:
-            if isinstance(b, discord.ui.Button) and b.style != discord.ButtonStyle.link:
-                if b.custom_id in ("prev","first"):
-                    b.disabled = (self.page <= 1) or (self.pages <= 1)
-                elif b.custom_id in ("next","last"):
-                    b.disabled = (self.page >= self.pages) or (self.pages <= 1)
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="⏮ First", style=discord.ButtonStyle.secondary, custom_id="first")
-    async def first(self, interaction: discord.Interaction, _):
-        if self.page != 1:
-            self.page = 1
-        await self.update(interaction)
-
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.primary, custom_id="prev")
-    async def prev(self, interaction: discord.Interaction, _):
-        if self.page > 1:
-            self.page -= 1
-        await self.update(interaction)
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary, custom_id="next")
-    async def next(self, interaction: discord.Interaction, _):
-        if self.page < self.pages:
-            self.page += 1
-        await self.update(interaction)
-
-    @discord.ui.button(label="Last ⏭", style=discord.ButtonStyle.secondary, custom_id="last")
-    async def last(self, interaction: discord.Interaction, _):
-        if self.page != self.pages:
-            self.page = self.pages
-        await self.update(interaction)
-
-# ---------------------------- Units pager (buttons) ----------------------------
-class UnitsPagerView(discord.ui.View):
-    def __init__(self, names, page_size=20):
-        super().__init__(timeout=120)
-        self.names = names or []
-        self.page_size = max(5, min(50, int(page_size or 20)))
-        self.page = 1
-        self.pages = max(1, (len(self.names) + self.page_size - 1)//self.page_size)
-
-    def build_embed(self):
-        start = (self.page-1)*self.page_size
-        chunk = self.names[start:start+self.page_size]
-        desc = "\n".join(f"{start+i+1}. {nm}" for i, nm in enumerate(chunk)) or "—"
-        e = discord.Embed(
-            title=f"Units (page {self.page}/{self.pages})",
-            description=desc,
-            color=discord.Color.blurple()
-        )
-        e.set_footer(text=f"{len(self.names)} total units — tip: /unit <name> for details")
-        return e
-
-    async def update(self, interaction: discord.Interaction):
-        for b in self.children:
-            if isinstance(b, discord.ui.Button):
-                if b.custom_id in ("prev","first"):
-                    b.disabled = (self.page <= 1) or (self.pages <= 1)
-                elif b.custom_id in ("next","last"):
-                    b.disabled = (self.page >= self.pages) or (self.pages <= 1)
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="⏮ First", style=discord.ButtonStyle.secondary, custom_id="first")
-    async def first(self, interaction: discord.Interaction, _):
-        if self.page != 1:
-            self.page = 1
-        await self.update(interaction)
-
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.primary, custom_id="prev")
-    async def prev(self, interaction: discord.Interaction, _):
-        if self.page > 1:
-            self.page -= 1
-        await self.update(interaction)
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary, custom_id="next")
-    async def next(self, interaction: discord.Interaction, _):
-        if self.page < self.pages:
-            self.page += 1
-        await self.update(interaction)
-
-    @discord.ui.button(label="Last ⏭", style=discord.ButtonStyle.secondary, custom_id="last")
-    async def last(self, interaction: discord.Interaction, _):
-        if self.page != self.pages:
-            self.page = self.pages
-        await self.update(interaction)
-
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary, custom_id="close_units")
-    async def close(self, interaction: discord.Interaction, _):
-        for c in self.children: c.disabled = True
-        await interaction.response.edit_message(view=self)
-
-# ------------------------------- Commands ------------------------------------
-def _unit_pool_from_images() -> List[str]:
-    pool = []
-    for k in IMAGES.keys():
-        pretty = " ".join(w.capitalize() for w in k.split())
-        pool.append(pretty)
-    for u in UNITS:
-        if u not in pool: pool.append(u)
-    return sorted(pool)
-
-async def unit_detail(interaction: discord.Interaction, name: str):
-    name = resolve_alias(name)
-    path = build_unit_composite(name)
-    e = discord.Embed(title=name, color=discord.Color.teal())
-    if path and os.path.isfile(path):
-        fn = os.path.basename(path); file = discord.File(path, filename=fn)
-        e.set_image(url=f"attachment://{fn}")
-        await interaction.response.send_message(embed=e, file=file)
-    else:
-        await interaction.response.send_message(embed=e)
-
-@tree.command(name="unit", description="Show a unit (image + stats if available)")
-@app_commands.describe(name="Unit name (aliases supported)")
-async def unit_cmd(interaction: discord.Interaction, name: str):
-    await unit_detail(interaction, name)
-
-@tree.command(name="units", description="Browse units or show a specific unit (with pager)")
-@app_commands.describe(name="Optional: show details for this unit", per_page="Items per page (default 20)")
-async def units_cmd(interaction: discord.Interaction, name: Optional[str]=None, per_page: Optional[int]=20):
-    if name:
-        await unit_detail(interaction, name); return
-    names = _unit_pool_from_images()
-    view = UnitsPagerView(names, page_size=per_page or 20)
-    await interaction.response.send_message(embed=view.build_embed(), view=view)
-
-@tree.command(name="values", description="Open the official values links")
-async def values_cmd(interaction: discord.Interaction):
-    v = discord.ui.View()
-    v.add_item(discord.ui.Button(label="Values (Main Page)", url=VALUES_URL))
-    v.add_item(discord.ui.Button(label="Units/Gamepasses", url="https://sites.google.com/view/garden-td-values/unitsgamepasses?authuser=0"))
-    v.add_item(discord.ui.Button(label="Value Calculator", url=CALC_URL))
-    e = discord.Embed(title="Garden TD Values", description="Tap a button to open the official site.", color=discord.Color.green())
-    await interaction.response.send_message(embed=e, view=v)
-
-@tree.command(name="valueslive", description="(Experimental) Parse values from the site with pagination")
-@app_commands.describe(page_size="Items per page (default 10)")
-async def valueslive(interaction: discord.Interaction, page_size: Optional[int]=10):
-    await interaction.response.defer(thinking=True, ephemeral=False)
-    data, err = _try_fetch_values(VALUES_URL)
-    if not data:
-        msg = f"Could not load values from the website.\n> {err or 'Unknown error'}\n\nUse **/values** to open the official page."
-        await interaction.followup.send(msg); return
-    view = ValuesPagerView(data, page_size=page_size or 10)
-    await interaction.followup.send(embed=view.build_embed(), view=view)
-
-@tree.command(name="assetsinfo", description="Show image folder & counts")
-async def assetsinfo(interaction: discord.Interaction):
-    total_imgs=sum(len(v) for v in IMAGES.values())
-    await interaction.response.send_message(f"Assets folder: `{ASSETS_DIR}`\nImage groups: {len(IMAGES)}\nFiles: {total_imgs}", ephemeral=True)
-
-# ---- Wheel ----
-class WheelView(discord.ui.View):
-    def __init__(self, pool: List[str]):
-        super().__init__(timeout=90); self.pool=pool
-
-    async def case_gif(self, msg: discord.Message):
-        e = discord.Embed(title="🎁 Opening case...", color=discord.Color.gold()); await msg.edit(embed=e, view=self)
-        gif_path, winner = build_case_gif_stopping(self.pool)
-        if not gif_path or not os.path.isfile(gif_path):
-            await msg.edit(content="Could not build GIF (is Pillow installed?)", view=self); return
-        fn = os.path.basename(gif_path)
-        gif_file = discord.File(gif_path, filename=fn)
-        e.set_image(url=f"attachment://{fn}")
-        await msg.edit(embed=e, attachments=[gif_file], view=self)
-        fe = discord.Embed(title="🎉 Winner", description=f"**{winner}**", color=discord.Color.green())
-        imgs = find_images_for(winner); main,_ = pick_main_and_stats(imgs)
-        if main and os.path.isfile(main):
-            await msg.channel.send(embed=fe, file=discord.File(main))
+        img1 = Image.open(p1).convert("RGBA")
+        if p2 and os.path.isfile(p2):
+            img2 = Image.open(p2).convert("RGBA")
+            w = max(img1.width, img2.width)
+            h = img1.height + img2.height
+            out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            out.paste(img1, (0, 0), img1)
+            out.paste(img2, (0, img1.height), img2)
         else:
-            await msg.channel.send(embed=fe)
+            out = img1
+        buf = io.BytesIO()
+        out.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        with open(p1, "rb") as f:
+            return f.read()
 
-    async def spin(self, msg: discord.Message):
-        await self.case_gif(msg)
+def build_collage(names: List[str], price_labels: Optional[List[str]] = None) -> Optional[bytes]:
+    """Simple horizontal collage with small frames; up to 7 items looks nice."""
+    if not PIL_OK:
+        return None
+    tiles: List[Image.Image] = []
+    for nm in names:
+        p = asset_path_for(nm, 1) or asset_path_for(nm, 0) or asset_path_for(nm, -1)
+        if not p: 
+            continue
+        try:
+            im = Image.open(p).convert("RGBA")
+            # scale to uniform square tile
+            im = im.resize((110, 110), Image.LANCZOS)
+            # frame
+            fr = Image.new("RGBA", (126, 126), (60, 42, 16, 255))
+            fr.paste(im, (8, 8), im)
+            tiles.append(fr)
+        except Exception:
+            continue
+    if not tiles:
+        return None
+    pad = 8
+    w = pad + sum(t.width + pad for t in tiles)
+    h = tiles[0].height + pad * 2
+    out = Image.new("RGBA", (w, h), (35, 26, 18, 255))
+    x = pad
+    draw = ImageDraw.Draw(out)
+    for idx, t in enumerate(tiles):
+        out.paste(t, (x, pad), t)
+        if price_labels and idx < len(price_labels) and FONT:
+            lbl = price_labels[idx]
+            tw, th = draw.textsize(lbl, font=FONT)
+            draw.rectangle([x+4, pad + t.height - th - 6, x+4+tw+6, pad + t.height - 4], fill=(0,0,0,160))
+            draw.text((x+7, pad + t.height - th - 5), lbl, font=FONT, fill=(0,255,0))
+        x += t.width + pad
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
+
+# -------------------- Bot setup --------------------
+intents = discord.Intents.default()
+intents.members = True  # for role checks
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# Error helper to send ephemeral reply whether or not initial response was sent.
+async def send_text(inter: discord.Interaction, text: str, ephemeral: bool = True):
+    try:
+        if interaction.response.is_done():  # noqa
+            pass
+    except Exception:
+        pass
+    if hasattr(inter, "response") and not inter.response.is_done():
+        return await inter.response.send_message(text, ephemeral=ephemeral)
+    else:
+        return await inter.followup.send(text, ephemeral=ephemeral)
+
+# --------------- Economy helpers ---------------
+def guild_settings(guild_id: int) -> Dict[str, object]:
+    g = str(guild_id)
+    return ECON["settings"].setdefault(g, {})
+
+def set_guild_setting(guild_id: int, key: str, value) -> None:
+    ECON["settings"].setdefault(str(guild_id), {})[key] = value
+    _save_econ()
+
+def guild_setting(guild_id: int, key: str, default=None):
+    g = str(guild_id)
+    if g in ECON["settings"] and key in ECON["settings"][g]:
+        return ECON["settings"][g][key]
+    return CONFIG.get(key, default)
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _limits(guild_id: int) -> Tuple[int, int, float, int, str]:
+    s = guild_settings(guild_id)
+    min_bet = int(s.get("MIN_BET", CONFIG.get("MIN_BET", 10)))
+    max_bet = int(s.get("MAX_BET", CONFIG.get("MAX_BET", 50000)))
+    edge = float(s.get("HOUSE_EDGE", CONFIG.get("HOUSE_EDGE", 0.02)))
+    daily = int(s.get("DAILY_AMOUNT", CONFIG.get("DAILY_AMOUNT", 500)))
+    curr = str(s.get("CURRENCY", CONFIG.get("CURRENCY", "🍀")))
+    return (min_bet, max_bet, edge, daily, curr)
+
+async def eco_add(guild_id: int, user_id: int, delta: int) -> int:
+    g = str(guild_id)
+    u = str(user_id)
+    ECON["balances"].setdefault(g, {})
+    ECON["balances"][g][u] = int(ECON["balances"][g].get(u, 0)) + int(delta)
+    _save_econ()
+    return ECON["balances"][g][u]
+
+def eco_get(guild_id: int, user_id: int) -> int:
+    return int(ECON["balances"].get(str(guild_id), {}).get(str(user_id), 0))
+
+def _fmt_currency(n: int, symbol: str) -> str:
+    return f"{symbol}{n:,}" if symbol.strip() != "" else f"{n:,}"
+
+def _get_gambling_channel_id(guild_id: int) -> Optional[int]:
+    val = guild_setting(guild_id, "GAMBLING_CHANNEL_ID", None)
+    return int(val) if val else None
+
+def _get_banker_role_id(guild_id: int) -> Optional[int]:
+    val = guild_setting(guild_id, "BANKER_ROLE_ID", None)
+    return int(val) if val else None
+
+def user_is_banker(inter: discord.Interaction) -> bool:
+    if not inter.guild:
+        return False
+    if inter.user.guild_permissions.manage_guild:
+        return True
+    role_id = _get_banker_role_id(inter.guild.id)
+    if not role_id:
+        return False
+    if hasattr(inter.user, "roles"):
+        return any(getattr(r, "id", 0) == role_id for r in inter.user.roles)
+    return False
+
+def in_gambling_channel():
+    async def predicate(inter: discord.Interaction) -> bool:
+        if not inter.guild:
+            raise app_commands.CheckFailure("Gambling commands can only be used in a server.")
+        allowed_id = _get_gambling_channel_id(inter.guild.id)
+        if allowed_id is None:
+            return True
+        if inter.channel and inter.channel.id == int(allowed_id):
+            return True
+        chan = inter.guild.get_channel(int(allowed_id))
+        where = chan.mention if chan else f"<#{allowed_id}>"
+        raise app_commands.CheckFailure(f"Gambling commands are restricted to {where}.")
+    return app_commands.check(predicate)
+
+@tree.error
+async def _on_app_error(inter: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        try:
+            if not inter.response.is_done():
+                await inter.response.send_message(str(error), ephemeral=True)
+            else:
+                await inter.followup.send(str(error), ephemeral=True)
+        except Exception:
+            pass
+        return
+
+# -------------------- Commands: admin sync --------------------
+@tree.command(name="sync", description="Admin: force re-sync of commands to this server")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def sync_cmd(interaction: discord.Interaction):
+    try:
+        await tree.sync(guild=interaction.guild)
+        await interaction.response.send_message("✅ Synced slash commands to this server.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Sync failed: {e}", ephemeral=True)
+
+# -------------------- Units commands --------------------
+class UnitsPager(discord.ui.View):
+    def __init__(self, items: List[str], start: int = 0):
+        super().__init__(timeout=180)
+        self.items = items
+        self.idx = max(0, start)
+        self.per = 20
+        self.update_state()
+
+    def page(self) -> int:
+        return self.idx // self.per
+
+    def pages(self) -> int:
+        return max(1, math.ceil(len(self.items)/self.per))
+
+    def slice(self) -> List[str]:
+        s = self.page() * self.per
+        return self.items[s:s+self.per]
+
+    def update_state(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.custom_id == "prev":
+                    child.disabled = (self.page() == 0)
+                elif child.custom_id == "next":
+                    child.disabled = (self.page() >= self.pages()-1)
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, custom_id="prev")
+    async def prev(self, inter: discord.Interaction, btn: discord.ui.Button):
+        self.idx = max(0, self.idx - self.per)
+        self.update_state()
+        await inter.response.edit_message(**self._render())
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, custom_id="next")
+    async def next(self, inter: discord.Interaction, btn: discord.ui.Button):
+        self.idx = min((self.pages()-1)*self.per, self.idx + self.per)
+        self.update_state()
+        await inter.response.edit_message(**self._render())
+
+    def _render(self):
+        page = self.page() + 1
+        pages = self.pages()
+        desc_lines = []
+        s = self.slice()
+        start_idx = (page-1)*self.per + 1
+        for i, name in enumerate(s, start_idx):
+            desc_lines.append(f"{i}. {name}")
+        embed = discord.Embed(title=f"Units (page {page}/{pages})", description="\n".join(desc_lines) or "_empty_", color=0x5865F2)
+        embed.set_footer(text=f"{len(self.items)} total units — tip: /unit name:<unit> for details")
+        return {"embed": embed, "view": self}
+
+@tree.command(name="units", description="List all units (paginated) or show details for a unit")
+@app_commands.describe(name="Optional unit to show")
+async def units_cmd(interaction: discord.Interaction, name: Optional[str] = None):
+    if name:
+        u = find_unit(name)
+        if not u:
+            return await interaction.response.send_message(f"Couldn't find a unit named **{name}**.", ephemeral=True)
+        img = compose_unit_panel(u)
+        if img:
+            file = discord.File(io.BytesIO(img), filename="unit.png")
+            embed = discord.Embed(title=u, color=0x2ECC71)
+            embed.set_image(url="attachment://unit.png")
+            await interaction.response.send_message(embed=embed, file=file)
+        else:
+            await interaction.response.send_message(f"**{u}** — no images found in {ASSETS_DIR}", ephemeral=True)
+        return
+
+    items = list_units()
+    if not items:
+        return await interaction.response.send_message("No units found. Upload **units.txt** or add items.", ephemeral=True)
+    view = UnitsPager(items, start=0)
+    await interaction.response.send_message(**view._render())
+
+@tree.command(name="unit", description="Show a unit's picture (and stats if available)")
+async def unit_cmd(interaction: discord.Interaction, name: str):
+    u = find_unit(name) or name
+    img = compose_unit_panel(u)
+    if not img:
+        return await interaction.response.send_message(f"No images found for **{u}** in `{ASSETS_DIR}`.", ephemeral=True)
+    file = discord.File(io.BytesIO(img), filename="unit.png")
+    embed = discord.Embed(title=u, color=0x2ECC71)
+    embed.set_image(url="attachment://unit.png")
+    await interaction.response.send_message(embed=embed, file=file)
+
+class WheelView(discord.ui.View):
+    def __init__(self, chosen: str):
+        super().__init__(timeout=120)
+        self.chosen = chosen
 
     @discord.ui.button(label="Respin", style=discord.ButtonStyle.primary)
-    async def respin(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        try:
-            msg = await interaction.original_response()
-        except Exception:
-            msg = await interaction.followup.send("Spinning…")
-        await self.spin(msg)
+    async def respin(self, inter: discord.Interaction, btn: discord.ui.Button):
+        units = list_units()
+        if not units:
+            return await inter.response.send_message("No units found.", ephemeral=True)
+        choice = random.choice(units)
+        self.chosen = choice
+        img = compose_unit_panel(choice)
+        files = []
+        embed = discord.Embed(title="🎁 Winner", description=choice, color=0xF1C40F)
+        if img:
+            files.append(discord.File(io.BytesIO(img), filename="winner.png"))
+            embed.set_image(url="attachment://winner.png")
+        await inter.response.edit_message(embed=embed, attachments=files)
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary)
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for c in self.children: c.disabled = True
-        await interaction.response.edit_message(view=self)
+@tree.command(name="wheel", description="Spin a case and pick a random unit")
+async def wheel_cmd(interaction: discord.Interaction):
+    units = list_units()
+    if not units:
+        return await interaction.response.send_message("No units available.", ephemeral=True)
+    chosen = random.choice(units)
+    # "animation" header image as small collage of 7 random
+    strip = build_collage(random.sample(units, min(7, len(units)))) if PIL_OK else None
+    files = []
+    embed = discord.Embed(title="🎁 Opening case...", color=0xF1C40F)
+    if strip:
+        files.append(discord.File(io.BytesIO(strip), filename="strip.png"))
+        embed.set_image(url="attachment://strip.png")
+    view = WheelView(chosen)
+    await interaction.response.send_message(embed=embed, view=view, files=files)
 
-@tree.command(name="wheel", description="Open a case (animated GIF that stops on winner)")
-@app_commands.describe(include="Filter include", exclude="Filter exclude")
-async def wheel(interaction: discord.Interaction, include: Optional[str]=None, exclude: Optional[str]=None):
-    pool = filter_pool(_unit_pool_from_images(), include, exclude)
-    if not pool: await interaction.response.send_message("No units match your filters.", ephemeral=True); return
-    await interaction.response.defer(thinking=True)
-    holder = await interaction.followup.send(embed=discord.Embed(title="Spinning...", color=discord.Color.gold()))
-    await WheelView(pool).spin(holder)
-
-# ---- Team ----
 class TeamView(discord.ui.View):
-    def __init__(self, pool: List[str], size: int, allow_dup: bool):
-        super().__init__(timeout=90); self.pool=pool; self.size=size; self.allow_dup=allow_dup
-
-    async def spin(self, msg: discord.Message):
-        e = discord.Embed(title="🎲 Building Team...", color=discord.Color.gold()); await msg.edit(embed=e, view=self)
-        picks: List[str] = []
-        for slot in range(1, self.size+1):
-            for i in range(CONFIG["SPIN_HOPS_SLOT"]):
-                cand_pool = self.pool if self.allow_dup else [u for u in self.pool if u not in picks] or self.pool
-                cand = random.choice(cand_pool)
-                body = ("**Locked:**\n" + "\n".join(f"• {p}" for p in picks) + "\n\n") if picks else ""
-                e.description = body + f"**Slot {slot}:** >>> {cand}"
-                await msg.edit(embed=e, view=self); await asyncio.sleep(0.08+0.02*i)
-            if self.allow_dup: choice = random.choice(self.pool)
-            else:
-                rem = [u for u in self.pool if u not in picks]
-                choice = random.choice(rem) if rem else random.choice(self.pool)
-            picks.append(choice)
-        final = discord.Embed(title=f"✅ Final Team ({len(picks)})", description="\n".join(f"**{i+1}.** {n}" for i,n in enumerate(picks)), color=discord.Color.green())
-        await msg.edit(embed=final, view=self)
-        if CONFIG["SHOW_COLLAGE"]:
-            coll = build_strip(picks)
-            if coll and os.path.isfile(coll):
-                fn=os.path.basename(coll); file=discord.File(coll, filename=fn); ce=discord.Embed(title="Team Collage", color=discord.Color.dark_teal()); ce.set_image(url=f"attachment://{fn}")
-                await msg.channel.send(embed=ce, file=file)
+    def __init__(self, names: List[str]):
+        super().__init__(timeout=180)
+        self.names = names
 
     @discord.ui.button(label="Respin Team", style=discord.ButtonStyle.primary)
-    async def respin(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        try:
-            msg = await interaction.original_response()
-        except Exception:
-            msg = await interaction.followup.send("Building Team…")
-        await self.spin(msg)
+    async def respin(self, inter: discord.Interaction, btn: discord.ui.Button):
+        units = list_units()
+        if not units:
+            return await inter.response.send_message("No units found.", ephemeral=True)
+        self.names = random.sample(units, min(7, len(units)))
+        collage = build_collage(self.names) if PIL_OK else None
+        embed = discord.Embed(title="Team Collage", color=0x3498DB)
+        files = []
+        if collage:
+            files.append(discord.File(io.BytesIO(collage), filename="team.png"))
+            embed.set_image(url="attachment://team.png")
+        await inter.response.edit_message(embed=embed, attachments=files)
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary)
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for c in self.children: c.disabled = True
-        await interaction.response.edit_message(view=self)
+@tree.command(name="team", description="Create a random team of 7")
+async def team_cmd(interaction: discord.Interaction):
+    units = list_units()
+    if not units:
+        return await interaction.response.send_message("No units available.", ephemeral=True)
+    names = random.sample(units, min(7, len(units)))
+    collage = build_collage(names) if PIL_OK else None
+    embed = discord.Embed(title="Team Collage", color=0x3498DB)
+    files = []
+    if collage:
+        files.append(discord.File(io.BytesIO(collage), filename="team.png"))
+        embed.set_image(url="attachment://team.png")
+    view = TeamView(names)
+    await interaction.response.send_message(embed=embed, view=view, files=files)
 
-@tree.command(name="team", description="Roulette team builder (with filters)")
-@app_commands.describe(size="Team size (1-7, default 7)", allow_duplicates="Allow duplicates", include="Filter include", exclude="Filter exclude")
-async def team(interaction: discord.Interaction, size: Optional[int]=7, allow_duplicates: Optional[bool]=False, include: Optional[str]=None, exclude: Optional[str]=None):
-    pool = filter_pool(_unit_pool_from_images(), include, exclude)
-    if not pool: await interaction.response.send_message("No units match your filters.", ephemeral=True); return
-    size = max(1, min(7, int(size or 7)))
-    if not allow_duplicates: size = min(size, len(pool))
-    await interaction.response.defer(thinking=True)
-    holder = await interaction.followup.send(embed=discord.Embed(title="🎲 Building Team...", color=discord.Color.gold()))
-    await TeamView(pool, size, bool(allow_duplicates)).spin(holder)
+@tree.command(name="values", description="Show the official value list link")
+async def values_cmd(interaction: discord.Interaction):
+    url = "https://sites.google.com/view/garden-td-values/main-page?authuser=0"
+    embed = discord.Embed(title="Garden TD Values", description=f"[Open the live value list]({url})", color=0x95A5A6)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---- Clean "GUI" menu ----
-class MenuView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
+# -------------------- Ingest attachments --------------------
+def _sanitize_filename(name: str) -> str:
+    name = name.replace("\\", "/").split("/")[-1]
+    if CONFIG.get("UNDERSCORE_TO_SPACE", True):
+        name = name.replace("_", " ")
+    # strip control chars
+    name = "".join(ch for ch in name if ch >= " " and ch not in ':"<>|')
+    return name
 
-    @discord.ui.button(label="Open Case", style=discord.ButtonStyle.success, emoji="🎁")
-    async def open_case(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        pool = _unit_pool_from_images()
-        holder = await interaction.followup.send(embed=discord.Embed(title="Spinning...", color=discord.Color.gold()), ephemeral=True)
-        await WheelView(pool).spin(holder)
-
-    @discord.ui.button(label="Team (7)", style=discord.ButtonStyle.primary, emoji="🎲")
-    async def team7(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        pool = _unit_pool_from_images()
-        holder = await interaction.followup.send(embed=discord.Embed(title="🎲 Building Team...", color=discord.Color.gold()), ephemeral=True)
-        await TeamView(pool, 7, False).spin(holder)
-
-    @discord.ui.button(label="Values (Links)", style=discord.ButtonStyle.secondary, emoji="📊")
-    async def values(self, interaction: discord.Interaction, button: discord.ui.Button):
-        v = discord.ui.View()
-        v.add_item(discord.ui.Button(label="Values (Main Page)", url=VALUES_URL))
-        v.add_item(discord.ui.Button(label="Units/Gamepasses", url="https://sites.google.com/view/garden-td-values/unitsgamepasses?authuser=0"))
-        v.add_item(discord.ui.Button(label="Value Calculator", url=CALC_URL))
-        e = discord.Embed(title="Garden TD Values", description="Open the official lists:", color=discord.Color.green())
-        await interaction.response.send_message(embed=e, view=v, ephemeral=True)
-        return
-
-    @discord.ui.button(label="Units List", style=discord.ButtonStyle.secondary, emoji="📜")
-    async def units(self, interaction: discord.Interaction, button: discord.ui.Button):
-        names = _unit_pool_from_images()
-        view = UnitsPagerView(names, page_size=20)
-        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
-        return
-
-@tree.command(name="menu", description="Open the bot menu")
-async def menu(interaction: discord.Interaction):
-    e = discord.Embed(
-        title="🌿 ToukaBot",
-        description="Pick an action below. You can also use slash commands like /wheel, /team, /unit.",
-        color=discord.Color.dark_green()
-    )
-    e.set_footer(text="Tip: use /autorole set to auto-assign a role when someone joins")
-    await interaction.response.send_message(embed=e, view=MenuView(), ephemeral=True)
-
-# ---- Reload & Config ----
-@tree.command(name="reload", description="Reload units and images")
-async def reload_all(interaction: discord.Interaction):
-    global IMAGES, ALIASES, UNITS, OUTPUT_DIR, CONFIG
-    IMAGES = scan_images(ASSETS_DIR)
-    ALIASES = load_aliases()
-    UNITS = load_units()
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    await interaction.response.send_message(f"Reloaded. Units: {len(UNITS)} | Image groups: {len(IMAGES)} | Aliases: {len(ALIASES)} | OUTPUT_DIR: {OUTPUT_DIR}", ephemeral=True)
-
-@tree.command(name="setoutputdir", description="Set the folder where GIFs/PNGs are saved")
-@app_commands.describe(path="Folder path (created if missing)")
-async def setoutputdir(interaction: discord.Interaction, path: str):
-    global OUTPUT_DIR, CONFIG
-    path = path.strip()
-    if not path:
-        await interaction.response.send_message("Path cannot be empty.", ephemeral=True); return
-    try:
-        os.makedirs(path, exist_ok=True)
-        OUTPUT_DIR = path
-        CONFIG["OUTPUT_DIR"] = path
-        _save_json(CONFIG_JSON, CONFIG)
-        await interaction.response.send_message(f"OUTPUT_DIR set to `{path}`.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"Failed to set OUTPUT_DIR: `{e}`", ephemeral=True)
-
-@tree.command(name="configshow", description="Show config")
-async def configshow(interaction: discord.Interaction):
-    txt = "\n".join(f"{k}: {v}" for k,v in CONFIG.items())
-    await interaction.response.send_message(f"```\n{txt}\n```", ephemeral=True)
-
-# ---- Autorole ----
-class AutoRoleGroup(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="autorole", description="Configure auto role on member join")
-
-    @app_commands.command(name="show", description="Show current auto-role")
-    async def show(self, interaction: discord.Interaction):
-        rid = CONFIG.get("AUTO_ROLE_ID")
-        if rid:
-            r = interaction.guild.get_role(int(rid)) if interaction.guild else None
-            await interaction.response.send_message(f"Auto-role: {r.mention if r else f'ID {rid}'}", ephemeral=True)
+async def _save_attachment(att: discord.Attachment) -> str:
+    data = await att.read()
+    safe = _sanitize_filename(att.filename)
+    ext = os.path.splitext(safe)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        out = os.path.join(ASSETS_DIR, safe)
+    elif ext == ".txt":
+        out = UNITS_TXT if "units" in safe.lower() else os.path.join(OUTPUT_DIR, safe)
+    elif ext == ".json":
+        if "aliases" in safe.lower():
+            out = ALIASES_JSON
         else:
-            await interaction.response.send_message("Auto-role is **not set**.", ephemeral=True)
+            out = os.path.join(OUTPUT_DIR, safe)
+    else:
+        out = os.path.join(OUTPUT_DIR, safe)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    if out.endswith(ALIASES_JSON):
+        global ALIASES
+        ALIASES = load_aliases()
+    return out
 
-    @app_commands.command(name="set", description="Set auto-role")
-    @app_commands.describe(role="Role to assign automatically on join")
-    async def set(self, interaction: discord.Interaction, role: discord.Role):
-        CONFIG["AUTO_ROLE_ID"] = int(role.id)
-        _save_json(CONFIG_JSON, CONFIG)
-        await interaction.response.send_message(f"Auto-role set to {role.mention}.", ephemeral=True)
 
-    @app_commands.command(name="clear", description="Clear auto-role")
-    async def clear(self, interaction: discord.Interaction):
-        CONFIG["AUTO_ROLE_ID"] = None
-        _save_json(CONFIG_JSON, CONFIG)
-        await interaction.response.send_message("Auto-role cleared.", ephemeral=True)
-
-tree.add_command(AutoRoleGroup())
-
-# ---- Upload-to-update commands ----
-@tree.command(name="updateset", description="Set the channel where you will upload images/txt/json to update the bot")
-@app_commands.describe(channel="Channel to watch for uploads")
-async def updateset(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not (interaction.user.guild_permissions.manage_guild or (OWNER_ID and interaction.user.id == OWNER_ID)):
-        await interaction.response.send_message("You need Manage Server to do that.", ephemeral=True); return
-    CONFIG["UPDATE_CHANNEL_ID"] = int(channel.id)
-    _save_json(CONFIG_JSON, CONFIG)
-    await interaction.response.send_message(f"Update channel set to {channel.mention}. Upload images/zip for assets, units.txt, or aliases.json here.", ephemeral=True)
-
-@tree.command(name="updateinfo", description="Show update upload settings")
-async def updateinfo(interaction: discord.Interaction):
-    ch_id = CONFIG.get("UPDATE_CHANNEL_ID")
-    ch = interaction.guild.get_channel(int(ch_id)) if ch_id and interaction.guild else None
-    txt = [
-        f"Update channel: {ch.mention if ch else f'ID {ch_id} (not in this guild?)'}",
-        "Accepted files: images (.png .jpg .jpeg .webp .gif), units.txt, aliases.json, .zip (extracted into units_assets/)",
-        "Permissions: Only users with **Manage Server** (or OWNER_ID) are processed."
-    ]
-    await interaction.response.send_message("\n".join(txt), ephemeral=True)
-
-@tree.command(name="ingest", description="Upload files to update bot resources (attach up to 5 files)")
-@app_commands.describe(file1="Attachment 1", file2="Attachment 2", file3="Attachment 3", file4="Attachment 4", file5="Attachment 5")
-async def ingest(interaction: discord.Interaction,
-                 file1: Optional[discord.Attachment]=None,
-                 file2: Optional[discord.Attachment]=None,
-                 file3: Optional[discord.Attachment]=None,
-                 file4: Optional[discord.Attachment]=None,
-                 file5: Optional[discord.Attachment]=None):
-    if not (interaction.user.guild_permissions.manage_guild or (OWNER_ID and interaction.user.id == OWNER_ID)):
-        await interaction.response.send_message("You need Manage Server to do that.", ephemeral=True); return
-    files = [f for f in [file1,file2,file3,file4,file5] if f]
+@tree.command(name="ingest", description="Upload & save files (images, units.txt, aliases.json, etc.)")
+@app_commands.describe(
+    file1="Attachment",
+    file2="Attachment",
+    file3="Attachment",
+    file4="Attachment",
+    file5="Attachment",
+    file6="Attachment",
+    file7="Attachment",
+    file8="Attachment",
+    file9="Attachment",
+    file10="Attachment"
+)
+async def ingest_cmd(
+    interaction: discord.Interaction,
+    file1: Optional[discord.Attachment] = None,
+    file2: Optional[discord.Attachment] = None,
+    file3: Optional[discord.Attachment] = None,
+    file4: Optional[discord.Attachment] = None,
+    file5: Optional[discord.Attachment] = None,
+    file6: Optional[discord.Attachment] = None,
+    file7: Optional[discord.Attachment] = None,
+    file8: Optional[discord.Attachment] = None,
+    file9: Optional[discord.Attachment] = None,
+    file10: Optional[discord.Attachment] = None,
+):
+    files = [f for f in (file1,file2,file3,file4,file5,file6,file7,file8,file9,file10) if f is not None]
     if not files:
-        await interaction.response.send_message("Attach 1–5 files with the command.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
-    results = await _ingest_attachments(files)
-    summary = "\n".join(f"• {r}" for r in results if r) or "No files processed."
-    await interaction.followup.send(f"**Ingest complete.**\n{summary}", ephemeral=True)
+        return await interaction.response.send_message("Please supply one or more attachments via the options.", ephemeral=True)
+    saved = []
+    for att in files[:10]:
+        path = await _save_attachment(att)
+        saved.append(os.path.basename(path))
+    await interaction.response.send_message(f"Saved: {', '.join(saved)}", ephemeral=True)
+@tree.command(name="daily", description="Claim your daily reward")
+@in_gambling_channel()
+async def daily_cmd(interaction: discord.Interaction):
+    if not guild_setting(interaction.guild.id, "GAMBLING_ENABLED", True):
+        return await interaction.response.send_message("Gambling is disabled here.", ephemeral=True)
+    _,_,_,daily,curr = _limits(interaction.guild.id)
+    last = ECON["last_daily"].setdefault(str(interaction.guild.id), {}).get(str(interaction.user.id), 0)
+    now = _now_ts()
+    if now - last < 23*3600 + 30*60:  # allow a little drift
+        remain = (23*3600 + 30*60) - (now - last)
+        return await interaction.response.send_message(f"You already claimed daily. Try again in **{remain//3600}h {(remain%3600)//60}m**.", ephemeral=True)
+    ECON["last_daily"].setdefault(str(interaction.guild.id), {})[str(interaction.user.id)] = now
+    new_bal = await eco_add(interaction.guild.id, interaction.user.id, daily)
+    await interaction.response.send_message(f"You received **{_fmt_currency(daily, curr)}**. Balance: **{_fmt_currency(new_bal, curr)}**.", ephemeral=True)
 
-# ------------------------------ Token loader ---------------------------------
+@tree.command(name="balance", description="Check your balance (or someone else's)")
+async def balance_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    bal = eco_get(interaction.guild.id, target.id)
+    _,_,_,_,curr = _limits(interaction.guild.id)
+    await interaction.response.send_message(f"{target.mention} balance: **{_fmt_currency(bal, curr)}**.", ephemeral=True)
 
-# === GTD: webhook uploader helpers ===
-def _ensure_under_limit(path: str, max_bytes: int) -> str:
+@tree.command(name="coinflip", description="Coinflip (2x minus house edge)")
+@in_gambling_channel()
+@app_commands.describe(side="heads/tails", bet="bet amount")
+async def coinflip_cmd(interaction: discord.Interaction, side: str, bet: int):
+    if not guild_setting(interaction.guild.id, "GAMBLING_ENABLED", True):
+        return await interaction.response.send_message("Gambling is disabled here.", ephemeral=True)
+    side = side.lower().strip()
+    if side not in ("heads", "tails"):
+        return await interaction.response.send_message("Choose **heads** or **tails**.", ephemeral=True)
+    min_bet, max_bet, edge, _, curr = _limits(interaction.guild.id)
+    if bet < min_bet or bet > max_bet:
+        return await interaction.response.send_message(f"Bet must be between {min_bet} and {max_bet}.", ephemeral=True)
+    if eco_get(interaction.guild.id, interaction.user.id) < bet:
+        return await interaction.response.send_message("Insufficient balance.", ephemeral=True)
+    res = random.choice(("heads", "tails"))
+    if res == side:
+        win = int(round(bet * (2.0 - edge)))
+        new_bal = await eco_add(interaction.guild.id, interaction.user.id, win)
+        await interaction.response.send_message(f"🪙 **{res.upper()}**! You won **{_fmt_currency(win, curr)}**. New balance: **{_fmt_currency(new_bal, curr)}**.", ephemeral=True)
+    else:
+        new_bal = await eco_add(interaction.guild.id, interaction.user.id, -bet)
+        await interaction.response.send_message(f"🪙 **{res.upper()}**. You lost **{_fmt_currency(bet, curr)}**. Balance: **{_fmt_currency(new_bal, curr)}**.", ephemeral=True)
+
+SLOT_EMOJI = ["🍒", "🍋", "🍇", "🔔", "⭐"]
+@tree.command(name="slots", description="Slots (3 reels) – 3x ≈9x, 2 in a row ≈2x (minus edge)")
+@in_gambling_channel()
+@app_commands.describe(bet="bet amount")
+async def slots_cmd(interaction: discord.Interaction, bet: int):
+    if not guild_setting(interaction.guild.id, "GAMBLING_ENABLED", True):
+        return await interaction.response.send_message("Gambling is disabled here.", ephemeral=True)
+    min_bet, max_bet, edge, _, curr = _limits(interaction.guild.id)
+    if bet < min_bet or bet > max_bet:
+        return await interaction.response.send_message(f"Bet must be between {min_bet} and {max_bet}.", ephemeral=True)
+    if eco_get(interaction.guild.id, interaction.user.id) < bet:
+        return await interaction.response.send_message("Insufficient balance.", ephemeral=True)
+    reels = [random.choice(SLOT_EMOJI) for _ in range(3)]
+    text = " | ".join(reels)
+    win = 0
+    if len(set(reels)) == 1:
+        win = int(round(bet * (9.0 - edge)))
+    elif reels[0] == reels[1] or reels[1] == reels[2]:
+        win = int(round(bet * (2.0 - edge)))
+    if win > 0:
+        new_bal = await eco_add(interaction.guild.id, interaction.user.id, win)
+        await interaction.response.send_message(f"{text}\nYou won **{_fmt_currency(win, curr)}**! New balance: **{_fmt_currency(new_bal, curr)}**", ephemeral=True)
+    else:
+        new_bal = await eco_add(interaction.guild.id, interaction.user.id, -bet)
+        await interaction.response.send_message(f"{text}\nNo win. Lost **{_fmt_currency(bet, curr)}** — Balance: **{_fmt_currency(new_bal, curr)}**", ephemeral=True)
+
+@tree.command(name="give", description="Give currency to another user")
+@in_gambling_channel()
+@app_commands.describe(user="recipient", amount="amount to transfer")
+async def give_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if user.bot or user.id == interaction.user.id:
+        return await interaction.response.send_message("Invalid recipient.", ephemeral=True)
+    if amount <= 0:
+        return await interaction.response.send_message("Amount must be > 0.", ephemeral=True)
+    if eco_get(interaction.guild.id, interaction.user.id) < amount:
+        return await interaction.response.send_message("Insufficient balance.", ephemeral=True)
+    await eco_add(interaction.guild.id, interaction.user.id, -amount)
+    new_bal = await eco_add(interaction.guild.id, user.id, amount)
+    _,_,_,_,curr = _limits(interaction.guild.id)
+    await interaction.response.send_message(f"Transferred **{_fmt_currency(amount, curr)}** to {user.mention}. (Their balance: **{_fmt_currency(new_bal, curr)}**)", ephemeral=True)
+
+@tree.command(name="leaderboard", description="Top 10 balances")
+@in_gambling_channel()
+async def leaderboard_cmd(interaction: discord.Interaction):
+    g = str(interaction.guild.id)
+    _,_,_,_,curr = _limits(interaction.guild.id)
+    board = sorted(ECON["balances"].get(g, {}).items(), key=lambda kv: kv[1], reverse=True)[:10]
+    lines = []
+    for i, (uid, amt) in enumerate(board, 1):
+        member = interaction.guild.get_member(int(uid))
+        name = member.mention if member else f"<@{uid}>"
+        lines.append(f"**{i}.** {name} — {_fmt_currency(amt, curr)}")
+    desc = "\n".join(lines) or "_No balances yet_"
+    embed = discord.Embed(title="Leaderboard", description=desc, color=0xE67E22)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="gambling_settings", description="Admin: configure gambling settings")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    enabled="Enable/disable gambling",
+    currency="Currency symbol (e.g., 🍀, 💎, $)",
+    min_bet="Minimum bet",
+    max_bet="Maximum bet",
+    house_edge="House edge (2 or 0.02 = 2%)",
+    daily="Daily payout",
+    channel="Restrict gambling commands to this channel",
+    clear_channel="Clear the channel restriction",
+    banker_role="Role allowed to grant coins (besides Manage Server)",
+    clear_banker_role="Clear banker role"
+)
+async def gambling_settings_cmd(
+    interaction: discord.Interaction,
+    enabled: Optional[bool] = None,
+    currency: Optional[str] = None,
+    min_bet: Optional[int] = None,
+    max_bet: Optional[int] = None,
+    house_edge: Optional[float] = None,
+    daily: Optional[int] = None,
+    channel: Optional[discord.TextChannel] = None,
+    clear_channel: Optional[bool] = None,
+    banker_role: Optional[discord.Role] = None,
+    clear_banker_role: Optional[bool] = None
+):
+    if enabled is not None:
+        set_guild_setting(interaction.guild.id, "GAMBLING_ENABLED", bool(enabled))
+    if currency is not None:
+        set_guild_setting(interaction.guild.id, "CURRENCY", currency[:3])
+    if min_bet is not None:
+        set_guild_setting(interaction.guild.id, "MIN_BET", int(min_bet))
+    if max_bet is not None:
+        set_guild_setting(interaction.guild.id, "MAX_BET", int(max_bet))
+    if house_edge is not None:
+        edge = house_edge if house_edge < 1 else (house_edge/100.0)
+        set_guild_setting(interaction.guild.id, "HOUSE_EDGE", float(edge))
+    if daily is not None:
+        set_guild_setting(interaction.guild.id, "DAILY_AMOUNT", int(daily))
+    if channel is not None:
+        set_guild_setting(interaction.guild.id, "GAMBLING_CHANNEL_ID", int(channel.id))
+    if clear_channel:
+        set_guild_setting(interaction.guild.id, "GAMBLING_CHANNEL_ID", None)
+    if banker_role is not None:
+        set_guild_setting(interaction.guild.id, "BANKER_ROLE_ID", int(banker_role.id))
+    if clear_banker_role:
+        set_guild_setting(interaction.guild.id, "BANKER_ROLE_ID", None)
+
+    # summary message
+    min_bet, max_bet, edge, daily_amt, curr = _limits(interaction.guild.id)
+    chan_id = _get_gambling_channel_id(interaction.guild.id)
+    chan_ref = interaction.guild.get_channel(chan_id) if chan_id else None
+    chan_txt = chan_ref.mention if chan_ref else "Any channel"
+    br_id = _get_banker_role_id(interaction.guild.id)
+    br_ref = interaction.guild.get_role(br_id) if br_id else None
+    br_txt = br_ref.mention if br_ref else "Manage Server only"
+
+    await interaction.response.send_message(
+        f"Settings for **{interaction.guild.name}**:\n"
+        f"Enabled: {guild_setting(interaction.guild.id, 'GAMBLING_ENABLED', True)}\n"
+        f"Currency: {curr} | Min: {min_bet} | Max: {max_bet}\n"
+        f"Edge: {edge*100:.1f}% | Daily: {daily_amt}\n"
+        f"Gambling channel: {chan_txt}\n"
+        f"Banker role: {br_txt}",
+        ephemeral=True
+    )
+
+@tree.command(name="grant", description="(Admin/Banker) Grant coins to a user")
+@in_gambling_channel()
+@app_commands.describe(user="Recipient", amount="Amount to add (positive only)", reason="Optional note")
+async def grant_cmd(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 100000000], reason: Optional[str]=None):
+    if not interaction.guild or user.bot:
+        return await interaction.response.send_message("Invalid recipient.", ephemeral=True)
+    if not user_is_banker(interaction):
+        return await interaction.response.send_message("You need Manage Server or the configured Banker role.", ephemeral=True)
+    new_bal = await eco_add(interaction.guild.id, user.id, int(amount))
+    _,_,_,_,curr = _limits(interaction.guild.id)
+    note = f" Reason: {reason}" if reason else ""
+    await interaction.response.send_message(f"Added **{_fmt_currency(int(amount), curr)}** to {user.mention}. New balance: **{_fmt_currency(new_bal, curr)}**.{note}", ephemeral=True)
+
+# -------------------- Startup --------------------
+@bot.event
+async def on_ready():
     try:
-        if os.path.getsize(path) <= max_bytes:
-            return path
-    except OSError:
-        return path
-    from PIL import Image
-    im = Image.open(path).convert("RGB")
-    q = 90
-    tmp = os.path.splitext(path)[0] + ".jpg"
-    while q >= 50:
-        im.save(tmp, "JPEG", quality=q, optimize=True)
-        if os.path.getsize(tmp) <= max_bytes: break
-        q -= 10
-    return tmp
+        guild_ids = os.environ.get("GUILD_IDS", "").strip()
+        if guild_ids:
+            gids = [int(x) for x in guild_ids.split(",") if x.strip().isdigit()]
+            for gid in gids:
+                try:
+                    await tree.sync(guild=discord.Object(id=gid))
+                    print(f"[sync] synced for guild {gid}")
+                except Exception as e:
+                    print("sync error guild", gid, e)
+        else:
+            await tree.sync()
+            print("[sync] global")
+    except Exception as e:
+        print("sync failure", e)
+    print(f"Logged in as {bot.user}")
 
-def send_images_to_webhook(webhook_url: str, paths: list, caption="Garden TD value cards", max_mb=8, username=None):
-    max_bytes = max_mb * 1024 * 1024
-    with requests.Session() as s:
-        for i in range(0, len(paths), 10):  # Discord: ≤10 attachments/message
-            batch = paths[i:i+10]
-            form, opened = {}, []
-            try:
-                for idx, p in enumerate(batch):
-                    pp = _ensure_under_limit(p, max_bytes)
-                    f = open(pp, "rb"); opened.append(f)
-                    form[f"files[{idx}]"] = (os.path.basename(pp), f, "application/octet-stream")
-                payload = {"content": caption}
-                form["payload_json"] = (None, json.dumps(payload), "application/json")
-                r = s.post(GTD_WEBHOOK_URL, files=form, timeout=60)
-                if r.status_code == 429:
-                    import time
-                    time.sleep(r.json().get("retry_after", 1000) / 1000.0)
-                    r = s.post(GTD_WEBHOOK_URL, files=form, timeout=60)
-                r.raise_for_status()
-            finally:
-                for f in opened:
-                    try: f.close()
-                    except: pass
-
-# Default webhook; can override via env GTD_WEBHOOK_URL
-GTD_WEBHOOK_URL = os.getenv("GTD_WEBHOOK_URL", "https://discord.com/api/webhooks/1415085009714417864/xMkUAHRQd-9KZDbynYgVObuLBkZn4yY2jwPLGh_6xj2mC9ePwOmtO2oPrv1XKjwsAgJN")
-
-
-# === GTD: slash commands ===
-@tree.command(name="gtdshots", description="Capture official Garden TD value cards (all 7 pages) and upload here")
-@discord.app_commands.describe(pages="Total pages (default 7)", only="Optional regex to filter unit names")
-async def gtdshots_cmd(interaction: discord.Interaction, pages: int = 7, only: str = None):
-    await interaction.response.defer(thinking=True)
-    # Run blocking Playwright capture off-thread
-    loop = asyncio.get_event_loop()
-    paths = await loop.run_in_executor(
-        None,
-        functools.partial(
-            capture_gtd_cards,
-            pages=int(pages or 7),
-            out_dir="shots_from_bot",
-            only_regex=only,
-            channel=None,   # set to "msedge"/"chrome" if Chromium cannot be installed
-            headed=False,
-            debug=False
-        )
-    )
-    if not paths:
-        await interaction.followup.send("No images were produced."); return
-    for i in range(0, len(paths), 10):
-        batch = [discord.File(p) for p in paths[i:i+10]]
-        await interaction.followup.send(files=batch)
-        await asyncio.sleep(0.8)
-
-@tree.command(name="gtdwebhook", description="Capture value cards and send them via the configured webhook")
-@discord.app_commands.describe(pages="Total pages (default 7)", only="Optional regex to filter unit names")
-async def gtdwebhook_cmd(interaction: discord.Interaction, pages: int = 7, only: str = None):
-    if not GTD_WEBHOOK_URL:
-        await interaction.response.send_message("Webhook not configured. Set GTD_WEBHOOK_URL.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    loop = asyncio.get_event_loop()
-    paths = await loop.run_in_executor(
-        None,
-        functools.partial(
-            capture_gtd_cards,
-            pages=int(pages or 7),
-            out_dir="shots_webhook",
-            only_regex=only,
-            channel=None,
-            headed=False,
-            debug=False
-        )
-    )
-    if not paths:
-        await interaction.followup.send("No images were produced."); return
-    await loop.run_in_executor(None, functools.partial(send_images_to_webhook, GTD_WEBHOOK_URL, paths, "Garden TD values"))
-    await interaction.followup.send("Sent to webhook ✅", ephemeral=True)
-
-
-def load_token() -> str:
-    tok = os.getenv("DISCORD_TOKEN")
-    if tok: return tok.strip()
-    if os.path.exists("token.txt"):
-        with open("token.txt", "r", encoding="utf-8") as f:
+def _load_token() -> Optional[str]:
+    tok = os.environ.get("DISCORD_TOKEN") or os.environ.get("TOKEN")
+    if tok:
+        return tok.strip()
+    if os.path.isfile(TOKEN_PATH):
+        with open(TOKEN_PATH, "r", encoding="utf-8") as f:
             return f.read().strip()
-    raise RuntimeError("No Discord token found! Set DISCORD_TOKEN or create token.txt")
+    return None
 
 def main():
-    print("[boot] starting… OUTPUT_DIR:", OUTPUT_DIR)
-    tok = load_token()
-    bot.run(tok)
+    token = _load_token()
+    if not token:
+        print("[boot] No token found. Set DISCORD_TOKEN or create token.txt")
+        return
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    bot.run(token)
 
 if __name__ == "__main__":
     main()
