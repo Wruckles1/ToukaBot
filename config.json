@@ -14,5 +14,14 @@
   "CASE_FINAL_HOLD_MS": 1600,
   "GIF_LOOP": 1,
   "AUTO_ROLE_ID": null,
-  "UNDERSCORE_TO_SPACE": true
+  "UNDERSCORE_TO_SPACE": true,
+  "CURRENCY": "🪙",
+  "DAILY_AMOUNT": 500,
+  "MIN_BET": 10,
+  "MAX_BET": 50000,
+  "HOUSE_EDGE_BP": 100,
+  "GAMBLING_CHANNEL_ID": null,
+  "BANKER_ROLE_ID": null,
+  "AUTOROLE_ID": null,
+  "ANNOUNCE_CHANNEL_ID": null
 }
