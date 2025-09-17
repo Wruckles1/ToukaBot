@@ -202,15 +202,12 @@ def _ensure_online_casino_images(min_count: int = 6) -> None:
         _download_image_sync(url, dest)
 
 def casino_banner_image(max_tiles: int = 6, tile_size: int = 110, pad: int = 8) -> Optional[bytes]:
-    """Create a banner image from casino_assets images (png/jpg). Returns PNG bytes or None."""
+    """Create a banner image from units_assets files ending with '1.png'. Returns PNG bytes or None."""
     if not PIL_OK:
         return None
     if not os.path.isdir(CASINO_ASSETS_DIR):
         return None
-    try:
-        files = [os.path.join(CASINO_ASSETS_DIR, fn) for fn in sorted(os.listdir(CASINO_ASSETS_DIR)) if fn.lower().endswith((".png",".jpg",".jpeg"))]
-    except Exception:
-        files = []
+    files = [os.path.join(ASSETS_DIR, fn) for fn in sorted(os.listdir(ASSETS_DIR)) if fn.lower().endswith("1.png")]
     if not files:
         return None
     import random
@@ -313,6 +310,11 @@ intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+
+# Casino admin slash command group
+casinoadmin = app_commands.Group(name="casinoadmin", description="Casino admin tools")
+tree.add_command(casinoadmin)
+
 
 async def send_text(inter: discord.Interaction, text: str, ephemeral: bool = True):
     try:
@@ -778,36 +780,52 @@ async def blackjack_cmd(interaction: discord.Interaction, bet: int):
 @tree.command(name="crash", description="Crash game — cash out before it explodes")
 @in_gambling_channel()
 @app_commands.describe(bet="bet amount")
+
 async def crash_cmd(interaction: discord.Interaction, bet: int):
-    if not guild_setting(interaction.guild.id, "GAMBLING_ENABLED", True): return await interaction.response.send_message("Gambling is disabled here.", ephemeral=True)
+    if not guild_setting(interaction.guild.id, "GAMBLING_ENABLED", True):
+        return await interaction.response.send_message("Gambling is disabled here.", ephemeral=True)
     min_bet, max_bet, edge, _, curr = _limits(interaction.guild.id)
-    if not (min_bet <= bet <= max_bet): return await interaction.response.send_message(f"Bet must be between {min_bet} and {max_bet}.", ephemeral=True)
-    if eco_get(interaction.guild.id, interaction.user.id) < bet: return await interaction.response.send_message("Insufficient balance.", ephemeral=True)
+    if not (min_bet <= bet <= max_bet):
+        return await interaction.response.send_message(f"Bet must be between {min_bet} and {max_bet}.", ephemeral=True)
+    if eco_get(interaction.guild.id, interaction.user.id) < bet:
+        return await interaction.response.send_message("Insufficient balance.", ephemeral=True)
+    MIN_CASHOUT = 1.25
     multiplier = 1.0
+    bust_at = 1.05 + (random.random() ** 3.0) * 2.95
     class CrashView(discord.ui.View):
-        def __init__(self): super().__init__(timeout=20); self.cashed = False
+        def __init__(self):
+            super().__init__(timeout=25)
+            self.cashed = False
         @discord.ui.button(label="Cash Out", style=discord.ButtonStyle.success)
         async def cashout(self, inter: discord.Interaction, _btn: discord.ui.Button):
-            if self.cashed: return
+            nonlocal multiplier
+            if self.cashed:
+                return
+            if multiplier < MIN_CASHOUT:
+                return await inter.response.send_message(f"You can't cash out before **{MIN_CASHOUT:.2f}x**.", ephemeral=True)
             self.cashed = True
-            win = max(0, int(round(bet * (multiplier - edge))))
-            new_bal = await eco_add(interaction.guild.id, interaction.user.id, win); log_history(interaction.guild.id, interaction.user.id, "crash", bet, win)
-            em = discord.Embed(title="🚀 Crash", description=f"{interaction.user.mention} cashed at **{multiplier:.2f}x** — won **{_fmt_currency(win,curr)}**.\nBalance: **{_fmt_currency(new_bal,curr)}**")
+            profit_mult = max(0.0, multiplier - 1.0 - edge)
+            win = int(round(bet * profit_mult))
+            new_bal = await eco_add(interaction.guild.id, interaction.user.id, win)
+            log_history(interaction.guild.id, interaction.user.id, "crash", bet, win)
+            em = discord.Embed(title="🚀 Crash", description=(f"{interaction.user.mention} cashed at **{multiplier:.2f}x** — won **{_fmt_currency(win, curr)}**.\nBalance: **{_fmt_currency(new_bal, curr)}**"))
             await inter.response.edit_message(embed=em, view=None)
     view = CrashView()
-    await interaction.response.send_message(embed=discord.Embed(title="🚀 Crash", description=f"{interaction.user.mention} started a round. Rising... press **Cash Out**!"), view=view)
+    await interaction.response.send_message(embed=discord.Embed(title="🚀 Crash", description=(f"{interaction.user.mention} started a round. Rising... press **Cash Out** after **{MIN_CASHOUT:.2f}x**!")), view=view)
     msg = await interaction.original_response()
-    for _ in range(24):
-        await asyncio.sleep(1)
-        if view.cashed: return
-        multiplier *= 1 + random.uniform(0.05, 0.35)
-        if random.random() < 0.12 + (multiplier-1)*0.02: break
-        await msg.edit(embed=discord.Embed(title="🚀 Crash", description=f"**{interaction.user.mention}** Multiplier: **{multiplier:.2f}x**\nCash out before 💥!"), view=view)
+    while not view.cashed:
+        await asyncio.sleep(0.9)
+        if view.cashed:
+            return
+        multiplier *= 1 + random.uniform(0.06, 0.22)
+        if multiplier >= bust_at:
+            break
+        await msg.edit(embed=discord.Embed(title="🚀 Crash", description=(f"**{interaction.user.mention}** Multiplier: **{multiplier:.2f}x**\nCash out before 💥 (min **{MIN_CASHOUT:.2f}x**)!")), view=view)
     if not view.cashed:
-        new_bal = await eco_add(interaction.guild.id, interaction.user.id, -bet); log_history(interaction.guild.id, interaction.user.id, "crash", bet, -bet)
-        await msg.edit(embed=discord.Embed(title="💥 Crash", description=f"{interaction.user.mention} — crashed at **{multiplier:.2f}x** and lost **{_fmt_currency(bet,curr)}**.\nBalance: **{_fmt_currency(new_bal,curr)}**"), view=None)
+        new_bal = await eco_add(interaction.guild.id, interaction.user.id, -bet)
+        log_history(interaction.guild.id, interaction.user.id, "crash", bet, -bet)
+        await msg.edit(embed=discord.Embed(title="💥 Crash", description=(f"{interaction.user.mention} — crashed at **{multiplier:.2f}x** and lost **{_fmt_currency(bet, curr)}**.\nBalance: **{_fmt_currency(new_bal, curr)}**")), view=None)
 
-# ---------- NEW: Hi/Lo card game ----------
 @tree.command(name="hilo", description="Hi/Lo — guess if the next card is higher or lower")
 @in_gambling_channel()
 @app_commands.describe(bet="bet amount")
@@ -1201,7 +1219,7 @@ class CasinoView(discord.ui.View):
         self.guild_id = guild_id
         self.per_user_bet: dict[int, int] = {opener_id: max(0, int(initial_bet))}
 
-        # --- utilities ---
+    # --- utilities ---
     def get_bet(self, user_id: int) -> int:
         min_bet, max_bet, _, _, _ = _limits(self.guild_id)
         return max(min_bet, min(self.per_user_bet.get(user_id, min_bet), max_bet))
@@ -1213,18 +1231,18 @@ class CasinoView(discord.ui.View):
         return v
 
     
-    def render_embed(self) -> discord.Embed:
-        min_bet, max_bet, edge, _, curr = _limits(self.guild_id)
-        desc_lines = [
+def render_embed(self) -> discord.Embed:
+    min_bet, max_bet, edge, _, curr = _limits(self.guild_id)
+    desc_lines = [
         "**How to play:** Use the buttons below — no need to type commands.",
         "**Bets:** Everyone controls their own bet. Default = min bet.",
         f"**Limits:** Min {min_bet} {curr}, Max {max_bet} {curr}",
         "",
         "Tip: Press **Set Bet** to choose your bet. Results & balances post publicly."
-        ]
-        em = discord.Embed(title="🎰 Casino", description="\n".join(desc_lines), color=0x00A38B)
-        em.set_footer(text="Use /gambling_settings to tune currency and limits.")
-        return em
+    ]
+    em = discord.Embed(title="🎰 Casino", description="\n".join(desc_lines), color=0x00A38B)
+    em.set_footer(text="Use /gambling_settings to tune currency and limits.")
+    return em
 
 
     async def _guard(self, interaction: discord.Interaction, bet: int) -> bool:
@@ -1240,7 +1258,7 @@ class CasinoView(discord.ui.View):
             return False
         return True
 
-        # --- bet controls ---
+    # --- bet controls ---
     @discord.ui.button(label="Set Bet", style=discord.ButtonStyle.primary, row=0)
     async def set_bet_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         await interaction.response.send_modal(SetBetModal(self))
@@ -1261,7 +1279,7 @@ class CasinoView(discord.ui.View):
         self.per_user_bet[interaction.user.id] = min_bet
         await interaction.response.send_message(f"Your bet reset to **{min_bet:,}**.", ephemeral=True)
 
-        # --- coinflip ---
+    # --- coinflip ---
     @discord.ui.button(label="Coinflip: Heads", style=discord.ButtonStyle.success, row=1)
     async def cf_heads(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         bet = self.get_bet(interaction.user.id)
@@ -1294,7 +1312,7 @@ class CasinoView(discord.ui.View):
             log_history(interaction.guild.id, interaction.user.id, "coinflip", bet, -bet)
             await interaction.response.send_message(f"🪙 **HEADS.** {interaction.user.mention} lost **{_fmt_currency(bet,curr)}**. Balance: **{_fmt_currency(new_bal,curr)}**.")
 
-        # --- slots ---
+    # --- slots ---
     @discord.ui.button(label="Slots", style=discord.ButtonStyle.primary, row=1)
     async def slots_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         bet = self.get_bet(interaction.user.id)
@@ -1313,7 +1331,7 @@ class CasinoView(discord.ui.View):
             log_history(interaction.guild.id, interaction.user.id, "slots", bet, -bet)
             await interaction.response.send_message(f"{interaction.user.mention} rolled **{text}** — no win. Lost **{_fmt_currency(bet, curr)}** — Balance: **{_fmt_currency(new_bal, curr)}**")
 
-        # --- dice ---
+    # --- dice ---
     @discord.ui.button(label="Dice: High", style=discord.ButtonStyle.success, row=2)
     async def dice_high(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         bet = self.get_bet(interaction.user.id)
@@ -1346,7 +1364,7 @@ class CasinoView(discord.ui.View):
             log_history(interaction.guild.id, interaction.user.id, "dice", bet, -bet)
             await interaction.response.send_message(f"🎲 {interaction.user.mention} rolled **{roll}** (Low) — lost **{_fmt_currency(bet,curr)}**. Balance: **{_fmt_currency(new_bal,curr)}**")
 
-        # --- roulette ---
+    # --- roulette ---
     @discord.ui.button(label="Roulette: Red", style=discord.ButtonStyle.danger, row=3)
     async def roul_red(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         bet = self.get_bet(interaction.user.id)
@@ -1403,7 +1421,7 @@ class CasinoView(discord.ui.View):
             log_history(interaction.guild.id, interaction.user.id, "roulette", bet, -bet)
             await interaction.response.send_message(f"🎡 {interaction.user.mention} → **{num}** ({color}) — miss. Lost **{_fmt_currency(bet,curr)}**. Balance: **{_fmt_currency(new_bal,curr)}**")
 
-        # --- blackjack/crash/hilo/guess reuse handlers ---
+    # --- blackjack/crash/hilo/guess reuse handlers ---
     @discord.ui.button(label="Blackjack", style=discord.ButtonStyle.success, row=4)
     async def blackjack_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
         bet = self.get_bet(interaction.user.id)
@@ -1447,51 +1465,39 @@ class CasinoView(discord.ui.View):
 
 
 
-        # --- paging ---
-    @discord.ui.button(label="⟨ Prev", style=discord.ButtonStyle.secondary, row=0)
-    async def prev_page(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        embed = self.render_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
+# --- paging ---
+@discord.ui.button(label="⟨ Prev", style=discord.ButtonStyle.secondary, row=0)
+async def prev_page(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+    embed = self.render_embed()
+    await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="Next ⟩", style=discord.ButtonStyle.secondary, row=4)
-    async def next_page(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        embed = self.render_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
+@discord.ui.button(label="Next ⟩", style=discord.ButtonStyle.secondary, row=4)
+async def next_page(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+    embed = self.render_embed()
+    await interaction.response.edit_message(embed=embed, view=self)
 
-@tree.command(name="casino", description="Open a casino GUI with all games (buttons).")
+
+@tree.command(name="casino", description="Show all gambling slash commands")
 @in_gambling_channel()
-async def casino_cmd(interaction: discord.Interaction, bet: Optional[int] = None):
-
-    min_bet, max_bet, _, _, _ = _limits(interaction.guild.id)
-    start_bet = bet if (bet is not None) else max(min_bet, min(eco_get(interaction.guild.id, interaction.user.id)//20, max_bet))
-
-    view = CasinoView(opener_id=interaction.user.id, guild_id=interaction.guild.id, initial_bet=start_bet)
-    embed = view.render_embed()
-
-    # 1) Respond **immediately** (no blocking banner work here)
-    await interaction.response.send_message(embed=embed, view=view)
-
-    # 2) Build banner in the background and edit message once ready
-    async def _attach_banner():
-        try:
-            banner = casino_banner_image()
-            if not banner:
-                return
-            msg = await interaction.original_response()
-            files = [discord.File(io.BytesIO(banner), filename="casino.png")]
-            embed2 = view.render_embed()
-            embed2.set_image(url="attachment://casino.png")
-            await msg.edit(embed=embed2, attachments=files, view=view)
-        except Exception:
-            pass
-
-    try:
-        asyncio.create_task(_attach_banner())
-    except Exception:
-        pass
-
-casinoadmin = app_commands.Group(name="casinoadmin", description="Casino image admin")
-
+async def casino_cmd(interaction: discord.Interaction):
+    """Lightweight /casino: lists game commands so it never times out."""
+    cmds = [
+        ("/blackjack", "Play 21 vs the dealer"),
+        ("/coinflip", "Bet on heads or tails"),
+        ("/crash", "Cash out before it explodes"),
+        ("/roulette", "Red/Black/Number or 0-36"),
+        ("/slots", "Spin the slot machine"),
+        ("/guess", "Guess the number"),
+        ("/hilo", "Higher or Lower"),
+        ("/dice", "High/Low dice"),
+        ("/daily", "Claim your daily reward"),
+        ("/balance", "Check your balance"),
+        ("/leaderboard", "Top balances"),
+        ("/give", "Send coins to someone"),
+    ]
+    lines = "\n".join(f"**{c}** — {d}" for c, d in cmds)
+    em = discord.Embed(title="🎰 Casino — Commands", description=f"Use these commands to play:\n\n{lines}", color=0x00A38B)
+    await interaction.response.send_message(embed=em, ephemeral=False)
 @casinoadmin.command(name="images_add", description="Download an image URL into the casino banner folder")
 @banker_only()
 @app_commands.describe(url="Direct image URL (.png/.jpg)")
@@ -1531,78 +1537,35 @@ async def casino_images_list(interaction: discord.Interaction):
     await interaction.response.send_message(f"**{len(files)}** image(s):\n{txt}", ephemeral=True)
 
 
-@banker_only()
-@app_commands.describe(url="Direct image URL (.png/.jpg)")
-async def casino_images_add(interaction: discord.Interaction, url: str):
-    os.makedirs(CASINO_ASSETS_DIR, exist_ok=True)
-    fname = f"web_{int(time.time())}.png"
-    dest = os.path.join(CASINO_ASSETS_DIR, fname)
-    ok = _download_image_sync(url, dest)
-    if ok:
-        await interaction.response.send_message(f"✅ Saved **{fname}**", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ Failed to download. Check the URL.", ephemeral=True)
-
-
-@banker_only()
-async def casino_images_clear(interaction: discord.Interaction):
-    if not os.path.isdir(CASINO_ASSETS_DIR):
-        return await interaction.response.send_message("Folder not found.", ephemeral=True)
-    n = 0
-    for fn in os.listdir(CASINO_ASSETS_DIR):
-        try:
-            os.remove(os.path.join(CASINO_ASSETS_DIR, fn))
-            n += 1
-        except Exception:
-            pass
-    await interaction.response.send_message(f"🧹 Cleared {n} files.", ephemeral=True)
-
-
-@banker_only()
-async def casino_images_list(interaction: discord.Interaction):
-    if not os.path.isdir(CASINO_ASSETS_DIR):
-        return await interaction.response.send_message("_No folder_", ephemeral=True)
-    files = [fn for fn in os.listdir(CASINO_ASSETS_DIR) if fn.lower().endswith(('.png','.jpg','.jpeg'))]
-    if not files:
-        return await interaction.response.send_message("_No images stored_", ephemeral=True)
-    txt = "\n".join(f"- {fn}" for fn in files[:40])
-    await interaction.response.send_message(f"**{len(files)}** image(s):\n{txt}", ephemeral=True)
-
-
-
-
-tree.add_command(casinoadmin)
-
-# -------------------- Startup --------------------
+# -------------------- Ready / sync --------------------
 @bot.event
 async def on_ready():
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     try:
-        guild_ids = os.environ.get("GUILD_IDS", "").strip()
-        if guild_ids:
-            gids = [int(x) for x in guild_ids.split(",") if x.strip().isdigit()]
-            for gid in gids:
-                try:
-                    await tree.sync(guild=discord.Object(id=gid)); print(f"[sync] synced for guild {gid}")
-                except Exception as e:
-                    print("sync error guild", gid, e)
-        else:
-            await tree.sync(); print("[sync] global")
+        synced = await bot.tree.sync()
+        print(f"🔧 Slash commands synced: {len(synced)}")
     except Exception as e:
-        print("sync failure", e)
-    print(f"Logged in as {bot.user}")
+        print("⚠️ Slash sync failed:", e)
 
-def _load_token() -> Optional[str]:
-    tok = os.environ.get("DISCORD_TOKEN") or os.environ.get("TOKEN")
-    if tok: return tok.strip()
-    if os.path.isfile(TOKEN_PATH):
-        with open(TOKEN_PATH, "r", encoding="utf-8") as f: return f.read().strip()
-    return None
-
-def main():
-    token = _load_token()
-    if not token:
-        print("[boot] No token found. Set DISCORD_TOKEN or create token.txt"); return
-    os.makedirs(OUTPUT_DIR, exist_ok=True); bot.run(token)
-
+# -------------------- Startup --------------------
 if __name__ == "__main__":
-    main()
+    import logging, os
+    logging.basicConfig(level=logging.INFO)
+
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        try:
+            with open("token.txt","r",encoding="utf-8") as f:
+                token = f.read().strip()
+        except Exception:
+            token = None
+
+    if not token:
+        print("❌ No token. Set DISCORD_TOKEN or create token.txt next to bot.py")
+        raise SystemExit(1)
+
+    try:
+        bot.run(token)
+    except Exception as e:
+        logging.exception("Failed to start bot: %s", e)
+        raise
