@@ -9,3 +9,4 @@ units_assets/
 economy.json
 __pycache__/
 .venv/
+token.txt 
