@@ -1,121 +1,130 @@
-tomato
-cactus
-onion
-pomegranate 
-radish
-sawflower
-slingshot
-cabbage
-lumberjack
-vines
-farmer
-strawberry
-gnome
-eggplant
-potato 
-aloevera
-pineapple cannon
-rolling log
-dragon fruit
-scarecrow
-dandelion
-spikeroot
-cherries
-pumpkin
-ghost pepper
-money tree
-slapleaf
-stemstrike
-bamboo
-rose trap
-mushroom
-applepult
-baby carrots
-garlicopter
-durian
-grandma
-kiwi cannon
-venus floortrap
-drillbulb
-boombulb
-fruit molotov
-broccoli
-palm tree
-twilight pod
-inferno stump
-sonic bloom
-lemon tree
-drone
-pak choi
-umbra
-garden fairy
-repair worker
-speed sprinkler
-lawnmower
-blackberries
-blueberries
-fan flower
-peas in a pod
-plasmaspore
-walnut
-watermelon
-potshade
-sunflower
-laser plant
-prismleaf
-icebuds
-mango cluster
-stun flower
-rafflesia
-ballistic banana
-confusion plant
-lucky clover
-tiki tower
-electroleaf
-lil stump
-passion shooter
-pyropetal
-sporefang
-beehive
-bubble plant
-petalray
-venus flytrap
-bloodvine
-pesticider
-seed mech
-atomic pepper
-shadestool
-electric beetroot
-boomberries
-fisherman
-galactic shroom
-doompetal
-rafflesia
-chilly pepper
-double sunflower
-gnomeblitz
-grapes
-echosonic bloom
-hellroot
-timekeeper
-elemental bloo
-carrotastrophe
-voltshade
-big mushroom
-golem
-corn
-juggercorn
-blossom barrage
-ooga booga
-earth dragon
-budstrike
-dual blasterbud
-rosebeam
-stunnion
-daisy
-linkberry
-caulicannon
-ufo seedling
-robo flower
-mudmauler
-astral blossom
+tomato -0 star 
+cactus -0 star 
+onion -0 star 
+pomegranate -0 star 
+radish -0 star 
+sawflower -0 star 
+slingshot -0 star
+cabbage -0 star 
+lumberjack -0 star
+vines -0 star
+farmer -1 star 
+strawberry - 1 star 
+gnome -1 star
+eggplant -1 star
+potato -1 star
+aloevera -1 star
+pineapple cannon —1 star
+rolling log -1 star
+dragon fruit -1 star
+scarecrow -1 star
+dandelion -1 star
+spikeroot - 1 star
+cherries -2 star
+pumpkin -2 star
+ghost pepper -2 star
+money tree -2 star
+slapleaf -2 star
+stemstrike -2 star
+bamboo -2 star
+rose trap -2 star
+mushroom -2 star
+applepult -2 star 
+baby carrots -2 star
+durian -2 star
+grandma -2 star
+kiwi cannon -2 star
+venus floortrap -2 star
+drillbulb -2 star
+boombulb -3 star
+fruit molotov -3 star
+broccoli -3 star
+palm tree -3 star
+twilight pod -3 star
+inferno stump -3 star
+sonic bloom -3 star
+lemon tree -3 star
+drone -3 star
+pak choi-3 star 
+umbra -3 star 
+garden fairy -3 star 
+repair worker -4 star
+speed sprinkler -4 star
+lawnmower -4 star
+blackberries -4 star
+blueberries -4 star
+fan flower -4 star
+peas in a pod -4 star
+plasmaspore -4 star
+walnut -4 star
+watermelon -4 star 
+potshade -4 star
+sunflower -4 star
+laser plant -4 star
+prismleaf -5 star
+icebuds -5 star 
+mango cluster -5 star 
+stun flower -5 star 
+rafflesia -5 star 
+ballistic banana -5 star
+confusion plant -5 star
+lucky clover -5 star 
+tiki tower -5 star 
+electroleaf -5 star
+lil stump -5 star 
+passion shooter -5 star 
+pyropetal -5 star
+sporefang -5 star 
+beehive -5
+bubble plant -5 star 
+petalray -5 star 
+venus flytrap -5 star
+bloodvine -5 star 
+pesticider -5 star 
+seed mech -5 star 
+atomic pepper -5 star 
+shadestool -6 star 
+electric beetroot -6 star 
+boomberries -6 star 
+fisherman -6 star 
+galactic shroom -6 star 
+doompetal -6 star 
+rafflesia -5 star 
+chilly pepper -6 star 
+double sunflower -6 star 
+gnomeblitz-6 star 
+grapes -6 star 
+echosonic bloom -6 star 
+hellroot -6 star
+timekeeper -6 star 
+elemental bloom -6 star 
+carrotastrophe -6 star 
+voltshade -6 star 
+big mushroom -6 star 
+golem -6 star 
+corn -6 star 
+juggercorn -6 star 
+blossom barrage -6 star 
+ooga booga -6 star 
+earth dragon -6 star 
+budstrike -6 star 
+dual blasterbud -6 star 
+rosebeam -6 star 
+daisy -1 star 
+linkberry -2 star 
+caulicannon -2 star 
+ufo seedling -3 star 
+robo flower -4 star 
+mudmauler -5 star
+astral blossom -6 star
+vine hair -2 star
+bamboo pirate -2 star
+wisteria -2 star 
+garden alien -3 star
+stretch plant -5 star 
+rainbow dandelion -2 star
+auranji -5 star 
+beamstalk -6 star 
+egg plantinum -6 star 
+super sprout -5 star
+

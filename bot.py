@@ -1,3 +1,4 @@
+import re
 # -*- coding: utf-8 -*-
 """
 ToukaGTD bot - consolidated build (public gambling + editable redeem + extra games)
@@ -18,6 +19,79 @@ try:
 except Exception:
     PIL_OK = False
 
+
+
+
+# -------------------- Units.txt helper --------------------
+UNITS_TXT_PATH = "units.txt"
+def read_units_txt():
+    """Return a list of unit names from units.txt (ignores blank lines and # comments)."""
+    out = []
+    try:
+        with open(UNITS_TXT_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                out.append(s)
+    except Exception:
+        pass
+    return out
+# -------------------- JJK-style message spawns --------------------
+import json, time, random
+
+UNITSPAWN_JJK_PATH = "unitspawn_jjk.json"
+# guild_id -> {
+#   "channel_id": int, "min_msgs": 20, "max_msgs": 60,
+#   "reward_min": 0, "reward_max": 0, "chance": 100
+# }
+JJK_CFG = {}
+# Per-channel counters/state (non-persistent): (guild_id, channel_id) -> {"count": int, "threshold": int}
+JJK_STATE = {}
+# Active spawns: (guild_id, channel_id) -> {"unit": str, "deadline": float, "message_id": int}
+JJK_ACTIVE = {}
+
+def _jjk_load():
+    global JJK_CFG
+    try:
+        with open(UNITSPAWN_JJK_PATH, "r", encoding="utf-8") as f:
+            JJK_CFG = json.load(f)
+    except Exception:
+        JJK_CFG = {}
+
+def _jjk_save():
+    try:
+        with open(UNITSPAWN_JJK_PATH, "w", encoding="utf-8") as f:
+            json.dump(JJK_CFG, f)
+    except Exception:
+        pass
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+def _jjk_threshold(min_msgs: int, max_msgs: int) -> int:
+    if max_msgs < min_msgs: max_msgs = min_msgs
+    return random.randint(min_msgs, max_msgs)
+# -------------------- Unit Spawn Auto Config --------------------
+import json
+UNITSPAWN_CFG_PATH = "unitspawn.json"
+UNITSPAWN = {}  # guild_id -> {"channel_id": int, "min_min": 5, "max_min": 15, "reward_min": 0, "reward_max": 0, "chance": 100}
+UNITSPAWN_TASKS = {}  # guild_id -> asyncio.Task
+
+def _unitspawn_load():
+    global UNITSPAWN
+    try:
+        with open(UNITSPAWN_CFG_PATH, "r", encoding="utf-8") as f:
+            UNITSPAWN = json.load(f)
+    except Exception:
+        UNITSPAWN = {}
+
+def _unitspawn_save():
+    try:
+        with open(UNITSPAWN_CFG_PATH, "w", encoding="utf-8") as f:
+            json.dump(UNITSPAWN, f)
+    except Exception:
+        pass
 # -------------------- Configuration --------------------
 ASSETS_DIR = os.environ.get("ASSETS_DIR", "units_assets")
 CASINO_ASSETS_DIR = os.environ.get("CASINO_ASSETS_DIR", "casino_assets")
@@ -138,7 +212,7 @@ def find_unit(query: str) -> Optional[str]:
     key = norm_key(query)
     if key in ALIASES:
         return ALIASES[key]
-    units = list_units()
+    units = read_units_txt()
     if not units:
         return None
     low = [u.lower() for u in units]
@@ -526,7 +600,7 @@ class WheelView(discord.ui.View):
         super().__init__(timeout=120); self.chosen = chosen
     @discord.ui.button(label="Respin", style=discord.ButtonStyle.primary)
     async def respin(self, inter: discord.Interaction, btn: discord.ui.Button):
-        units = list_units()
+        units = read_units_txt()
         if not units: return await inter.response.send_message("No units found.", ephemeral=True)
         choice = random.choice(units); self.chosen = choice
         img = compose_unit_panel(choice); files = []; embed = discord.Embed(title="🎁 Winner", description=choice, color=0xF1C40F)
@@ -535,7 +609,7 @@ class WheelView(discord.ui.View):
 
 @tree.command(name="wheel", description="Spin a case and pick a random unit")
 async def wheel_cmd(interaction: discord.Interaction):
-    units = list_units()
+    units = read_units_txt()
     if not units: return await interaction.response.send_message("No units available.", ephemeral=True)
     chosen = random.choice(units)
     files = []; embed = discord.Embed(title="🎁 Opening case...", color=0xF1C40F)
@@ -546,14 +620,14 @@ class TeamView(discord.ui.View):
     def __init__(self, names: List[str]): super().__init__(timeout=180); self.names = names
     @discord.ui.button(label="Respin Team", style=discord.ButtonStyle.primary)
     async def respin(self, inter: discord.Interaction, btn: discord.ui.Button):
-        units = list_units()
+        units = read_units_txt()
         if not units: return await inter.response.send_message("No units found.", ephemeral=True)
         self.names = random.sample(units, min(7, len(units)))
         embed = discord.Embed(title="Team Collage", color=0x3498DB); await inter.response.edit_message(embed=embed)
 
 @tree.command(name="team", description="Create a random team of 7")
 async def team_cmd(interaction: discord.Interaction):
-    units = list_units()
+    units = read_units_txt()
     if not units: return await interaction.response.send_message("No units available.", ephemeral=True)
     names = random.sample(units, min(7, len(units))); embed = discord.Embed(title="Team Collage", color=0x3498DB)
     view = TeamView(names); await interaction.response.send_message(embed=embed, view=view)
@@ -1546,6 +1620,398 @@ async def on_ready():
         print(f"🔧 Slash commands synced: {len(synced)}")
     except Exception as e:
         print("⚠️ Slash sync failed:", e)
+
+
+# -------------------- Mini-game: Unit Quiz --------------------
+@tree.command(name="unitquiz", description="Guess the unit from a picture (uses your units_assets and units.txt)")
+@in_gambling_channel()
+@app_commands.describe(bet="Bet amount")
+async def unitquiz_cmd(interaction: discord.Interaction, bet: int):
+    if not guild_setting(interaction.guild.id, "GAMBLING_ENABLED", True):
+        return await interaction.response.send_message("Gambling is disabled here.", ephemeral=True)
+    units = read_units_txt()
+    if not units:
+        return await interaction.response.send_message("No units in **units.txt**.", ephemeral=True)
+    import random, os, io
+    candidates = [u for u in units if asset_path_for(u, 1)]
+    if not candidates:
+        return await interaction.response.send_message(f"No images ending with '1.png' found in `{ASSETS_DIR}`.", ephemeral=True)
+    correct = random.choice(candidates)
+    correct_path = asset_path_for(correct, 1)
+    others = [u for u in units if u != correct]
+    random.shuffle(others)
+    choices = [correct] + others[:3]
+    random.shuffle(choices)
+    min_bet, max_bet, edge, _, curr = _limits(interaction.guild.id)
+    if not (min_bet <= bet <= max_bet):
+        return await interaction.response.send_message(f"Bet must be between {min_bet} and {max_bet}.", ephemeral=True)
+    if eco_get(interaction.guild.id, interaction.user.id) < bet:
+        return await interaction.response.send_message("Insufficient balance.", ephemeral=True)
+    file = None
+    try:
+        with open(correct_path, "rb") as f:
+            imgdata = f.read()
+        fname = "unitquiz.png"
+        file = discord.File(io.BytesIO(imgdata), filename=fname)
+        image_url = f"attachment://{fname}"
+    except Exception:
+        file = None
+        image_url = None
+
+    class QuizView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=30)
+            self.answered = False
+            for label in choices:
+                self.add_item(self.UnitButton(label=label))
+
+        class UnitButton(discord.ui.Button):
+            def __init__(self, label: str):
+                super().__init__(label=label, style=discord.ButtonStyle.secondary)
+            async def callback(self, inter: discord.Interaction):
+                view: QuizView = self.view  # type: ignore
+                if not inter.user or inter.user.id != interaction.user.id:
+                    return await inter.response.send_message("Only the player who started this game can answer.", ephemeral=True)
+                if view.answered:
+                    return
+                view.answered = True
+                picked = self.label
+                win_delta = 0
+                if picked == correct:
+                    payout = max(0, int(round(bet * (3.0 - edge))))
+                    win_delta = payout
+                else:
+                    win_delta = -bet
+                new_bal = await eco_add(interaction.guild.id, interaction.user.id, win_delta)
+                log_history(interaction.guild.id, interaction.user.id, "unitquiz", bet, win_delta)
+                for c in view.children:
+                    if isinstance(c, discord.ui.Button):
+                        c.disabled = True
+                        if c.label == correct:
+                            c.style = discord.ButtonStyle.success
+                        elif c.label == picked:
+                            c.style = discord.ButtonStyle.danger
+                if picked == correct:
+                    outcome = f"✅ Correct! You win **{_fmt_currency(win_delta, curr)}**."
+                else:
+                    outcome = f"❌ Wrong ({picked}). The answer was **{correct}**. You lost **{_fmt_currency(bet, curr)}**."
+                em2 = discord.Embed(title="🧩 Unit Quiz — Result", description=f"{interaction.user.mention}\n{outcome}\nBalance: **{_fmt_currency(new_bal, curr)}**", color=0x2ECC71 if win_delta>0 else 0xE74C3C)
+                if image_url:
+                    em2.set_image(url=image_url)
+                await inter.response.edit_message(embed=em2, view=view)
+
+    em = discord.Embed(title="🧩 Unit Quiz", description=f"{interaction.user.mention}, pick the correct unit!", color=0x5865F2)
+    if image_url:
+        em.set_image(url=image_url)
+    await interaction.response.send_message(embed=em, view=QuizView(), file=file if file else discord.utils.MISSING)
+
+
+# -------------------- Mini-game: Unit Spawn --------------------
+@tree.command(name="unitspawn", description="Spawn a random unit; first person to claim wins (optional prize)")
+@app_commands.describe(reward="Optional prize amount to award the claimer (default 0)")
+async def unitspawn_cmd(interaction: discord.Interaction, reward: int = 0):
+    import random, os, io
+    # Load available units that have panel 1.png
+    units = read_units_txt()
+    candidates = [u for u in units if asset_path_for(u, 1)]
+    if not candidates:
+        return await interaction.response.send_message(f"No images ending with '1.png' found in `{ASSETS_DIR}`.", ephemeral=True)
+    unit = random.choice(candidates)
+    img_path = asset_path_for(unit, 1)
+
+    # Prepare attachment
+    file = None; image_url = None
+    try:
+        with open(img_path, "rb") as f:
+            data = f.read()
+        fname = "spawn.png"
+        file = discord.File(io.BytesIO(data), filename=fname)
+        image_url = f"attachment://{fname}"
+    except Exception:
+        pass
+
+    # Spawn view: first click wins
+    class SpawnView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=30)
+            self.claimed_by: discord.User | None = None
+        @discord.ui.button(label="Claim", style=discord.ButtonStyle.success)
+        async def claim(self, inter: discord.Interaction, _btn: discord.ui.Button):
+            if self.claimed_by is not None:
+                return await inter.response.send_message("Already claimed!", ephemeral=True)
+            self.claimed_by = inter.user
+            # disable button
+            for c in self.children:
+                if isinstance(c, discord.ui.Button):
+                    c.disabled = True
+            desc = f"**{inter.user.mention}** claimed **{unit}**!"
+            # Optional prize
+            prize_line = ""
+            if reward and reward > 0:
+                new_bal = await eco_add(interaction.guild.id, inter.user.id, reward)
+                prize_line = f"\nPrize: **{_fmt_currency(reward, _limits(interaction.guild.id)[4])}** — Balance: **{_fmt_currency(new_bal, _limits(interaction.guild.id)[4])}**"
+                log_history(interaction.guild.id, inter.user.id, "unitspawn", reward, reward)
+            em2 = discord.Embed(title="✨ A unit was claimed!", description=desc + prize_line, color=0xF1C40F)
+            if image_url: em2.set_image(url=image_url)
+            await inter.response.edit_message(embed=em2, view=self)
+
+    em = discord.Embed(title="✨ A wild unit appeared!", description="Be the first to press **Claim**!", color=0xF1C40F)
+    if image_url: em.set_image(url=image_url)
+    await interaction.response.send_message(embed=em, view=SpawnView(), file=file if file else discord.utils.MISSING)
+
+
+async def _unitspawn_send(channel: discord.TextChannel, reward_min: int, reward_max: int):
+    # Reuse logic from /unitspawn
+    import random, io, os
+    units = read_units_txt()
+    candidates = [u for u in units if asset_path_for(u, 1)]
+    if not candidates:
+        return
+    unit = random.choice(candidates)
+    img_path = asset_path_for(unit, 1)
+    file = None; image_url = None
+    try:
+        with open(img_path, "rb") as f:
+            data = f.read()
+        fname = "spawn.png"
+        file = discord.File(io.BytesIO(data), filename=fname)
+        image_url = f"attachment://{fname}"
+    except Exception:
+        pass
+
+    reward = 0
+    if reward_max and reward_max >= reward_min >= 0:
+        reward = random.randint(reward_min, reward_max)
+
+    class SpawnView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=30)
+            self.claimed_by = None
+        @discord.ui.button(label="Claim", style=discord.ButtonStyle.success)
+        async def claim(self, inter: discord.Interaction, _btn: discord.ui.Button):
+            if self.claimed_by is not None:
+                return await inter.response.send_message("Already claimed!", ephemeral=True)
+            self.claimed_by = inter.user
+            for c in self.children:
+                if isinstance(c, discord.ui.Button):
+                    c.disabled = True
+            desc = f"**{inter.user.mention}** claimed **{unit}**!"
+            prize_line = ""
+            if reward and reward > 0:
+                curr = _limits(channel.guild.id)[4]
+                new_bal = await eco_add(channel.guild.id, inter.user.id, reward)
+                log_history(channel.guild.id, inter.user.id, "unitspawn", reward, reward)
+                prize_line = f"\nPrize: **{_fmt_currency(reward, curr)}** — Balance: **{_fmt_currency(new_bal, curr)}**"
+            em2 = discord.Embed(title="✨ A unit was claimed!", description=desc + prize_line, color=0xF1C40F)
+            if image_url: em2.set_image(url=image_url)
+            await inter.response.edit_message(embed=em2, view=self)
+
+    em = discord.Embed(title="✨ A wild unit appeared!", description="Be the first to press **Claim**!", color=0xF1C40F)
+    if image_url: em.set_image(url=image_url)
+    await channel.send(embed=em, view=SpawnView(), file=file if file else discord.utils.MISSING)
+
+async def _unitspawn_worker(guild_id: int):
+    cfg = UNITSPAWN.get(str(guild_id))
+    if not cfg: 
+        return
+    while UNITSPAWN.get(str(guild_id)) is cfg:
+        try:
+            min_min = int(cfg.get("min_min", 5))
+            max_min = int(cfg.get("max_min", 15))
+            chance = int(cfg.get("chance", 100))
+            reward_min = int(cfg.get("reward_min", 0))
+            reward_max = int(cfg.get("reward_max", 0))
+            delay = random.randint(min_min, max(min_min, max_min)) * 60
+            await asyncio.sleep(delay)
+            # Random chance gate
+            roll = random.randint(1, 100)
+            if roll > chance:
+                continue
+            guild = bot.get_guild(int(guild_id))
+            if not guild: 
+                continue
+            channel = guild.get_channel(int(cfg["channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            await _unitspawn_send(channel, reward_min, reward_max)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            # keep worker alive
+            print(f"[unitspawn] worker error for {guild_id}: {e}")
+            await asyncio.sleep(5)
+
+
+@tree.command(name="unitspawn_auto_on", description="Enable random unit spawns in a channel")
+@app_commands.describe(channel="Channel for spawns", min_minutes="Minimum minutes between spawns", max_minutes="Maximum minutes between spawns", reward_min="Min reward", reward_max="Max reward", chance="Percent chance to spawn after each interval")
+async def unitspawn_auto_on(interaction: discord.Interaction, channel: discord.TextChannel, min_minutes: int = 5, max_minutes: int = 15, reward_min: int = 0, reward_max: int = 0, chance: int = 100):
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need **Manage Server** to use this.", ephemeral=True)
+    _unitspawn_load()
+    UNITSPAWN[str(interaction.guild.id)] = {"channel_id": channel.id, "min_min": min_minutes, "max_min": max_minutes, "reward_min": reward_min, "reward_max": reward_max, "chance": max(1, min(100, chance))}
+    _unitspawn_save()
+    # restart worker
+    t = UNITSPAWN_TASKS.pop(interaction.guild.id, None)
+    if t: t.cancel()
+    UNITSPAWN_TASKS[interaction.guild.id] = asyncio.create_task(_unitspawn_worker(interaction.guild.id))
+    await interaction.response.send_message(f"✅ Enabled auto spawns in {channel.mention}. Interval **{min_minutes}–{max_minutes} min**, chance **{chance}%**, reward **{reward_min}–{reward_max}**.", ephemeral=True)
+
+@tree.command(name="unitspawn_auto_off", description="Disable random unit spawns")
+async def unitspawn_auto_off(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need **Manage Server** to use this.", ephemeral=True)
+    _unitspawn_load()
+    cfg = UNITSPAWN.pop(str(interaction.guild.id), None)
+    _unitspawn_save()
+    t = UNITSPAWN_TASKS.pop(interaction.guild.id, None)
+    if t: t.cancel()
+    await interaction.response.send_message("🛑 Auto spawns disabled for this server.", ephemeral=True)
+
+@tree.command(name="unitspawn_settings", description="Show current auto spawn settings")
+async def unitspawn_settings(interaction: discord.Interaction):
+    _unitspawn_load()
+    cfg = UNITSPAWN.get(str(interaction.guild.id))
+    if not cfg:
+        return await interaction.response.send_message("Auto spawns are **off**.", ephemeral=True)
+    ch = interaction.guild.get_channel(int(cfg["channel_id"]))
+    await interaction.response.send_message(f"Channel: {ch.mention if ch else 'unknown'}\nInterval: **{cfg.get('min_min',5)}–{cfg.get('max_min',15)} min**\nChance: **{cfg.get('chance',100)}%**\nReward: **{cfg.get('reward_min',0)}–{cfg.get('reward_max',0)}**", ephemeral=True)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Let commands still work
+    await bot.process_commands(message)
+
+    # Ignore DMs, bots, webhooks
+    if not message.guild or message.author.bot or getattr(message, "webhook_id", None):
+        return
+
+    # If no content intent, quietly skip (Discord setting)
+    if not hasattr(message, "content"):
+        return
+
+    _jjk_load()
+    cfg = JJK_CFG.get(str(message.guild.id))
+    if not cfg:
+        return  # not enabled
+
+    ch_id = int(cfg.get("channel_id", 0))
+    if ch_id and ch_id != message.channel.id:
+        return
+
+    key = (message.guild.id, message.channel.id)
+
+    # If there is an active spawn: check for correct answer
+    active = JJK_ACTIVE.get(key)
+    if active:
+        # Check time
+        if time.time() > active["deadline"]:
+            JJK_ACTIVE.pop(key, None)
+        else:
+            unit = active["unit"]
+            if _norm_name(message.content) == _norm_name(unit):
+                # Winner!
+                reward_min = int(cfg.get("reward_min", 0))
+                reward_max = int(cfg.get("reward_max", 0))
+                reward = random.randint(reward_min, reward_max) if reward_max >= reward_min and reward_max > 0 else 0
+                curr = _limits(message.guild.id)[4]
+                if reward > 0:
+                    new_bal = await eco_add(message.guild.id, message.author.id, reward)
+                    log_history(message.guild.id, message.author.id, "unitspawn_jjk", reward, reward)
+                    prize = f"\nPrize: **{_fmt_currency(reward, curr)}** — Balance: **{_fmt_currency(new_bal, curr)}**"
+                else:
+                    prize = ""
+                try:
+                    msg = await message.channel.fetch_message(active["message_id"])
+                    em2 = discord.Embed(title="✨ Unit Captured!", description=f"**{message.author.mention}** captured **{unit}**!{prize}", color=0xF1C40F)
+                    # Preserve image if present
+                    if msg.embeds and msg.embeds[0].image and msg.embeds[0].image.url:
+                        em2.set_image(url=msg.embeds[0].image.url)
+                    await msg.edit(embed=em2, view=None)
+                except Exception:
+                    pass
+                JJK_ACTIVE.pop(key, None)
+                return  # stop processing to avoid also incrementing counter
+
+    # If no active spawn: increment counter and maybe spawn
+    min_msgs = int(cfg.get("min_msgs", 20))
+    max_msgs = int(cfg.get("max_msgs", 60))
+    chance = int(cfg.get("chance", 100))
+    st = JJK_STATE.get(key) or {"count": 0, "threshold": _jjk_threshold(min_msgs, max_msgs)}
+    st["count"] += 1
+    # Trigger when count >= threshold and chance gate passes
+    if st["count"] >= st["threshold"] and random.randint(1, 100) <= chance and key not in JJK_ACTIVE:
+        # reset counter/threshold
+        st["count"] = 0
+        st["threshold"] = _jjk_threshold(min_msgs, max_msgs)
+        # Try to spawn
+        units = read_units_txt()
+        candidates = [u for u in units if asset_path_for(u, 1)]
+        if candidates:
+            unit = random.choice(candidates)
+            img_path = asset_path_for(unit, 1)
+            file = None; image_url = None
+            try:
+                with open(img_path, "rb") as f:
+                    data = f.read()
+                fname = "spawn.png"
+                file = discord.File(io.BytesIO(data), filename=fname)
+                image_url = f"attachment://{fname}"
+            except Exception:
+                pass
+            em = discord.Embed(title="✨ A wild unit appeared!", description="Type the **exact name** of the unit to capture it!", color=0xF1C40F)
+            if image_url: em.set_image(url=image_url)
+            view = discord.ui.View()
+            # Optional give-up button to reveal after timeout
+            class Dummy(discord.ui.Button):
+                def __init__(self): super().__init__(label="Waiting for answer…", style=discord.ButtonStyle.secondary, disabled=True)
+            view.add_item(Dummy())
+            msg = await message.channel.send(embed=em, view=view, file=file if file else discord.utils.MISSING)
+            # Arm active spawn with 120s deadline
+            JJK_ACTIVE[key] = {"unit": unit, "deadline": time.time()+120, "message_id": msg.id}
+    JJK_STATE[key] = st
+
+
+@tree.command(name="unitspawn_jjk_on", description="Enable JJK-style message spawns in a channel")
+@app_commands.describe(channel="Channel for spawns", min_msgs="Minimum messages", max_msgs="Maximum messages", reward_min="Min reward", reward_max="Max reward", chance="Percent chance to spawn when threshold is met")
+async def unitspawn_jjk_on(interaction: discord.Interaction, channel: discord.TextChannel, min_msgs: int = 20, max_msgs: int = 60, reward_min: int = 0, reward_max: int = 0, chance: int = 100):
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need **Manage Server** to use this.", ephemeral=True)
+    _jjk_load()
+    JJK_CFG[str(interaction.guild.id)] = {"channel_id": channel.id, "min_msgs": min_msgs, "max_msgs": max_msgs, "reward_min": reward_min, "reward_max": reward_max, "chance": max(1, min(100, chance))}
+    _jjk_save()
+    # Reset per-channel state and clear any active spawn in that guild
+    for key in list(JJK_STATE.keys()):
+        if key[0] == interaction.guild.id:
+            JJK_STATE.pop(key, None)
+    for key in list(JJK_ACTIVE.keys()):
+        if key[0] == interaction.guild.id:
+            JJK_ACTIVE.pop(key, None)
+    await interaction.response.send_message(f"✅ Enabled message spawns in {channel.mention}. Threshold **{min_msgs}–{max_msgs} msgs**, chance **{chance}%**, reward **{reward_min}–{reward_max}**.", ephemeral=True)
+
+@tree.command(name="unitspawn_jjk_off", description="Disable JJK-style message spawns")
+async def unitspawn_jjk_off(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need **Manage Server** to use this.", ephemeral=True)
+    _jjk_load()
+    JJK_CFG.pop(str(interaction.guild.id), None)
+    _jjk_save()
+    for key in list(JJK_STATE.keys()):
+        if key[0] == interaction.guild.id:
+            JJK_STATE.pop(key, None)
+    for key in list(JJK_ACTIVE.keys()):
+        if key[0] == interaction.guild.id:
+            JJK_ACTIVE.pop(key, None)
+    await interaction.response.send_message("🛑 Message spawns disabled for this server.", ephemeral=True)
+
+@tree.command(name="unitspawn_jjk_settings", description="Show current JJK-style spawn settings")
+async def unitspawn_jjk_settings(interaction: discord.Interaction):
+    _jjk_load()
+    cfg = JJK_CFG.get(str(interaction.guild.id))
+    if not cfg:
+        return await interaction.response.send_message("JJK-style spawns are **off**.", ephemeral=True)
+    ch = interaction.guild.get_channel(int(cfg["channel_id"]))
+    await interaction.response.send_message(f"Channel: {ch.mention if ch else 'unknown'}\nThreshold: **{cfg.get('min_msgs',20)}–{cfg.get('max_msgs',60)} msgs**\nChance: **{cfg.get('chance',100)}%**\nReward: **{cfg.get('reward_min',0)}–{cfg.get('reward_max',0)}**", ephemeral=True)
 
 # -------------------- Startup --------------------
 if __name__ == "__main__":
